@@ -1,0 +1,200 @@
+---
+title: "04 Comparison protocols"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  #library(dmrseq)
+  library(rtracklayer)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(BiocParallel)
+  library(data.table)
+  library(hrbrthemes)
+})
+
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+
+# Data import
+```{r}
+matchedSamples <- c("A2_cADN", "A2_NM", "S15_SSL", "S15_NM")
+
+# bismarkBSseq objects
+bismarkBSseqCostum <- readRDS("./data/bismarkBSseq_train_ids.rds")
+bismarkBSseqRoche <- readRDS("./data/bismarkBSseq_parker_ids.rds")
+
+# Probe Meta data
+probAnnot <- readRDS("./meta_data/probeAnnot.rds")
+probeRegions <- makeGRangesFromDataFrame(as.data.frame(probAnnot), 
+                                         keep.extra.columns=TRUE)
+probAnnot[grepl("cADN", methylated_in) & grepl("SSL", methylated_in),]$methylated_in="cADN and SSL specific markers"
+probAnnot$methylated_in <- factor(probAnnot$methylated_in, 
+                                  levels=c("Control regions",
+                                           "Age dependent markers",
+                                           "cADN markers",
+                                           "SSL markers",
+                                           "cADN and SSL specific markers"), 
+                                  ordered=TRUE)
+
+# Methylation Values
+methValsRoche <- bsseq::getMeth(bismarkBSseqRoche, 
+                                regions=probeRegions, 
+                                type="raw", what="perRegion")
+colnames(methValsRoche) <- colData(bismarkBSseqRoche)$sample
+methValsRoche <- as.data.table(methValsRoche)
+methValsRoche$category <- probAnnot$methylated_in
+methValsRoche$probe <- probAnnot$probe
+
+methValsTrain <-bsseq::getMeth(bismarkBSseqCostum, 
+                               regions=probeRegions, 
+                               type="raw", what="perRegion")
+colnames(methValsTrain) <- colData(bismarkBSseqCostum)$sample
+methValsTrain <- as.data.table(methValsTrain)
+methValsTrain$category <- probAnnot$methylated_in
+methValsTrain$probe <- probAnnot$probe
+
+methValsMatchedCostum <- methValsTrain[,c(matchedSamples, "category", "probe"), with=FALSE]
+methValsMatchedCostum$type <- "costum"
+methValsMatchedRoche <- methValsRoche[,c(matchedSamples, "category", "probe"), with=FALSE]
+methValsMatchedRoche$type <- "roche"
+
+methVals <- rbind(methValsMatchedCostum, methValsMatchedRoche)
+methVals <- as.data.table(methVals)
+methValsTable <- melt(methVals, id.vars=c("probe", "category", "type"))
+setnames(methValsTable, c("variable"), c("sample"))
+
+trainSamples <- readRDS("./data/test_samples_ids.rds")
+
+# Read in metadata
+meta <- pData(bismarkBSseqCostum)
+```
+
+# Correlation plots
+
+Across all 4 samples
+```{r}
+methValsRocheTable <- subset(methValsTable, type=="roche")
+methValsCostumTable <- subset(methValsTable, type=="costum")
+
+methVals <- data.table(meth_roche=methValsRocheTable$value, 
+                       meth_costum=methValsCostumTable$value,
+                       category=methValsRocheTable$category,
+                       sample=methValsRocheTable$sample)
+
+corTest <- cor.test(methVals$meth_costum, methVals$meth_roche, method="pearson")
+ggplot(methVals, aes(x=meth_roche, 
+                     y=meth_costum, 
+                     color=sample))+
+  geom_point(alpha=0.6, size=0.8)+ #aes(shape=category)
+  labs(title="Comparison Protocols",
+       subtitle="Correlation methylated fractions (per Probe)",
+       y="Methylated fraction (this protocol)",
+       x="Methylated fraction (Parker et al.)")+
+  scale_color_brewer(palette="Dark2")+
+  annotate("text",x=0.15,y=0.8,label=paste("r:", round(corTest$estimate,2)), fontface = 'italic')+
+  #stat_cor(method="pearson")+
+  theme_ipsum()
+
+ggsave("./plots/comparison_meth_level.png")
+ggsave("./plots/comparison_meth_level.svg")
+```
+
+```{r}
+for(i in unique(methVals$sample))
+{
+ggplot(subset(methVals, sample==i), aes(x=meth_roche, 
+                     y=meth_costum, 
+                     color=category))+
+  ggtitle(i)+
+  geom_point(aes(shape=sample), alpha=0.6)+
+  xlab("Methylation level (Roche)")+
+  ylab("Methylation leve (Costum)")+
+  theme_ipsum()
+
+ggsave(file.path("./plots", 
+                 paste0("comparison_meth_level", i, ".png")))
+}
+```
+
+
+# Coverage plots
+
+Absolute coverage comparison: 
+```{r}
+bismarkBSseqCostum <- bismarkBSseqCostum[,bismarkBSseqCostum$sample %in% matchedSamples]
+covCostum <- getCoverage(bismarkBSseqCostum, type="Cov")
+covCostum <- data.frame(covCostum)
+colnames(covCostum) <- matchedSamples
+covCostum$type <- "costum"
+
+covRoche <- getCoverage(bismarkBSseqRoche, type = "Cov")
+covRoche <- data.frame(covRoche)
+colnames(covRoche) <- matchedSamples
+covRoche$type <- "roche"
+
+cov2 <- rbind(covCostum, covRoche)
+
+cov2long <- reshape2::melt(cov2, value.name = "cov", variable.name = "sample")
+ggplot(cov2long, aes(x= sample, y= cov, fill = type)) + 
+  geom_violin()+
+  #geom_boxplot(width=0.1, color="black", alpha=0.2, outlier.shape = NA)+
+  coord_cartesian(ylim = c(0,800))+
+  scale_fill_brewer(palette="Pastel1")+
+  labs(title="Read depth",
+       subtitle="at CpG level",
+       x="sample",
+       y="coverage",
+       fill="protocol")+
+  theme_ipsum()+
+  theme(axis.title.x = element_text(size=12))
+
+ggsave("./plots/coverage_comparison_violin.png", units=c("cm"),
+       width=30, height=30)
+```
+
+Coverage correlation: 
+```{r}
+
+
+```
+
+# Libsize plots
+```{r}
+totCostum <- colSums(covCostum[, matchedSamples])
+totCostum <- data.frame(sample=matchedSamples,
+                        libsize=totCostum)
+totCostum$type <- "costum"
+
+totRoche <- colSums(covRoche[, matchedSamples])
+totRoche <- data.frame(sample=matchedSamples,
+                       libsize=totRoche)
+totRoche$type <- "roche"
+
+tot <- rbind(totCostum, totRoche)
+
+ggplot(tot, aes(y=sample, x=libsize, fill=type))+
+  facet_grid(rows=vars(type))+
+  geom_bar(stat="identity")+
+  theme_ipsum()
+
+ggsave("./plots/comparison_libsize_sample.png", units=c("cm"), height=20, width=20)
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```

@@ -1,0 +1,120 @@
+---
+title: "05 DM testing"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+library(bsseq)
+library(data.table)
+library(edgeR)
+library(limma)
+library(NanoMethViz)
+source("utils.R")})
+
+set.seed(1896)
+
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+# Read the data
+
+```{r, load the data}
+# Read in CpG_report.txt files
+bismarkBSseqTrain <- readRDS("./data/bismarkBSseq_train_ids.rds")
+```
+
+# Filtering low-coverage CpGs
+
+```{r, filtering low-coverage CpGs}
+minCov <- 7 # minimal number of reads per CpG
+nSamples <- nrow(colData(bismarkBSseqTrain))
+bismarkBSseqTrain <- bismarkBSseqTrain[rowSums(getCoverage(bismarkBSseqTrain, 
+                                                           type = "Cov")>=minCov)==nSamples,]
+```
+
+# DM Testing - Voom+Limma
+
+```{r, probe annotation}
+probeAnnot <- rowData(bismarkBSseqTrain)
+```
+
+```{r, voom+limma}
+# get count matrix (NanoMethViz)
+countMat <- bsseq_to_edger(bismarkBSseqTrain)
+
+# construct design matrix
+colSamples <- unlist(tstrsplit(colnames(countMat), "_Un", keep=1))
+colSamples <- colSamples[!grepl("_Me", colSamples)]
+sampleInfo <- data.table(sample=colSamples)
+
+sampleInfo[,c("patient", "lesion_type"):=tstrsplit(sample, "_", keep=c(1,2))]
+sampleInfo[,condition:=fifelse(lesion_type=="NM", "normal", "cancer")]
+
+# count data with voom+limma (implemented in DMRCate)
+modCount <- model.matrix(~condition+patient, data=sampleInfo)
+modCount <- modelMatrixMeth(modCount)
+
+# get coverage
+meth <- getCoverage(bismarkBSseqTrain, type="M")
+cov <-  getCoverage(bismarkBSseqTrain, type="Cov")
+unmeth <- cov - meth
+
+# Limma paired-testing
+vm <- voom(countMat, modCount, lib.size = rep(colSums(meth+unmeth), each=2))$E
+fit <- lmFit(vm, modCount)
+fit <- eBayes(fit, robust=TRUE)
+ttVoomLimma <- topTable(fit,
+                        number=nrow(vm), 
+                        sort.by="none",  
+                        coef="conditionnormal",
+                        adjust.method="BH")
+
+resultsCpG <- data.table(cpg_name=rownames(ttVoomLimma),
+                         log_fc=ttVoomLimma$logFC,
+                         p_values=ttVoomLimma$P.Value,
+                         adj_p_values=ttVoomLimma$adj.P.Val,
+                         method=rep("Voom+Limma", nrow(ttVoomLimma)),
+                         cpg_start=probeAnnot$start_loci,
+                         cpg_chr=probeAnnot$seqnames_loci,
+                         probe_id=probeAnnot$probe,
+                         probe_chr=probeAnnot$seqnames_probe,
+                         probe_start=probeAnnot$start_probe,
+                         probe_end=probeAnnot$end_probe,
+                         master_id=probeAnnot$master_id,
+                         methylated_in=probeAnnot$methylated_in,
+                         genomic_locus=probeAnnot$genomic_locus)
+
+saveRDS(resultsCpG, "./data/dmTestCpGs.rds")
+```
+
+
+# Aggregate P-Values 
+
+```{r, p-value aggregation}
+# aggregate by Simes method
+resultsProbes <- resultsCpG[,.(p_value=simes(p_values),
+                               log_fc=mean(log_fc,na.rm=TRUE)), 
+                            by=c("method", "probe_id", "probe_chr",
+                                 "probe_start", "probe_end",
+                                 "master_id", "methylated_in", "genomic_locus")]
+
+# Multiple testing correction
+resultsProbes[,fdr:=p.adjust(p_value, method="BH"), by=c("method")]
+saveRDS(resultsProbes, "./data/dmTestProbes.rds")
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```

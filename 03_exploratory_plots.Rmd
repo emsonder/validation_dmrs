@@ -1,0 +1,352 @@
+---
+title: "03 Exploratory-plots"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, message=FALSE, warning=FALSE, include=FALSE}
+suppressPackageStartupMessages({
+library(data.table)
+library(ggplot2)
+library(RColorBrewer)
+library(ggrepel)
+library(GenomicRanges)
+library(stringr)
+library(RColorBrewer)
+library(rtracklayer)
+library(dplyr)
+library(ComplexHeatmap)
+library(viridis)
+library(bsseq)
+library(hrbrthemes)
+library(limma)
+source("utils.R")})
+
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+# Exploratory Patient Plots
+
+Load the previously processed files (01_data_processing_split.R)
+```{r}
+bismarkBSseqTrain <- readRDS("./data/bismarkBSseq_train_ids.rds")
+meta <- pData(bismarkBSseqTrain)
+
+# Probe meta data
+probAnnot <- readRDS("./meta_data/probeAnnot.rds")
+probeRegions <- makeGRangesFromDataFrame(as.data.frame(probAnnot), 
+                                         keep.extra.columns=TRUE)
+
+# Get methylation values
+# per Probe
+methProbes <- as.data.table(bsseq::getMeth(bismarkBSseqTrain, 
+                                           regions=probeRegions, 
+                                           type="raw", what="perRegion"))
+colnames(methProbes) <- as.character(colData(bismarkBSseqTrain)$sample)
+
+probAnnot[grepl("cADN", methylated_in) & grepl("SSL", methylated_in),]$methylated_in="cADN and SSL specific markers"
+probAnnot$methylated_in <- factor(probAnnot$methylated_in, 
+                                  levels=c("Control regions",
+                                           "Age dependent markers",
+                                           "cADN markers",
+                                           "SSL markers",
+                                           "cADN and SSL specific markers"), 
+                                  ordered=TRUE)
+
+methProbes$category <- probAnnot$methylated_in
+methProbes$probe <- probAnnot$probe
+
+# per CpG
+methFracCpG <- bsseq::getMeth(bismarkBSseqTrain, type="raw", withDimnames=TRUE)
+colnames(methFracCpG) <- colData(bismarkBSseqTrain)$sample
+```
+
+## scater plots for all patients
+```{r}
+trainMeta<- readRDS("./data/train_samples_ids.rds")
+trainSamples <- trainMeta$sample
+trainPatients <- unique(trainMeta$patient)
+```
+
+```{r, eval=FALSE, echo=FALSE}
+for(i in trainPatients){
+  samps <- as.character(meta$sample[meta$patient_id == i])
+  p <- ggplot(methProbes,aes_string(x=samps[2], y=samps[1], color = "category")) + 
+    geom_point() +
+    theme_bw() +
+    xlab(sprintf("Methylation level %s",samps[2])) +
+    ylab(sprintf("Methylation level %s",samps[1]))
+    #ggtitle("Normal Vs tumor methylation per probe")+
+    theme_ipsum()
+  ggsave(file.path("./plots", 
+                   sprintf("normalVstumor_%s.png",i)), p, width = 10, height = 5)
+}
+```
+
+# MDS Plot
+
+MDS plot of all train samples
+```{r}
+# Remove probes that are "Age dependent DMRs" and "tumors and normal mucosa"
+methProbesSub <- methProbes[!methProbes$category %in% c("Age dependent markers", 
+                                                        "control regions"),]
+
+# Choose only methylation values from this table
+methProbesSub <- methProbesSub[,c(as.character(trainSamples)), with=FALSE]
+dim(methProbesSub)
+
+# Transform methylation values for the MDS plot
+methsTR <- asin(2*as.matrix(methProbesSub)-1)
+
+# Calculate components for 2-dimension MDS plot
+#as a rule of thumb, I choose the top 10% of the total
+m2 <- limma::plotMDS(methsTR, dim.plot=c(1,2), top = 100, labels = colnames(methsTR))[c("x", "y")]
+m2 <- as.data.frame(m2)
+colnames(m2) <- c("MDS1","MDS2")
+m2 <- as.data.frame(m2)
+head(m2)
+
+# Add tissue and sample name to information to m2
+m2$tissue <- trainMeta$condition
+m2$sample <- trainMeta$sample
+head(m2)
+
+# Plot MDS
+ggplot(m2) + 
+  geom_point(aes(x = MDS1, y=MDS2, color = tissue)) +
+  geom_label_repel(aes(x = MDS1, y=MDS2, label = sample)) +
+  theme_bw() +
+  xlab("MDS 1") +
+  ylab("MDS 2") +
+  ggtitle("MDS plot with top 100 probes with largest standard deviations")
+ggsave("./plots/mds_labelled_points_ids_train.svg")
+ggsave("./plots/mds_labelled_points_ids_train.png")
+
+ggplot(m2) + 
+  geom_point(aes(x = MDS1, y=MDS2, color = tissue), size=2, alpha=0.8) +
+  scale_color_brewer(palette="Set2")+
+  theme_minimal() +
+  labs(title="MDS",
+       subtitle="top 100 probes with largest standard deviations",
+       x="MDS 1",
+       y="MDS 2")
+ggsave("./plots/mds_points_ids_train.svg")
+ggsave("./plots/mds_points_ids_train.png")
+```
+
+# Exploratory Probe Plots
+
+Number of CpGs per probe
+```{r}
+cov2 <- getCoverage(bismarkBSseqTrain, type = "Cov")
+cpgAnnot <- rowData(bismarkBSseqTrain)
+
+cov2 <- data.frame(cov2)
+probeCov <- cbind(cpgAnnot, "mean_cov"=rowMeans(cov2))
+probeCov <- as.data.table(probeCov)
+
+# Get number of CpGs per probe
+probeNCpGs <- probeCov[,.(n_cpgs=.N,
+                          mean_cov=mean(mean_cov)), 
+                          by=c("probe")]
+
+ggplot(probeNCpGs, aes(x=n_cpgs))+
+geom_histogram(color="black", fill="white")+
+xlab("N CpGs")+
+ylab("Probe count")+
+theme_bw()
+
+probeNCpGs$set <- "all Probes"
+ggplot(probeNCpGs, aes(x=set, y=n_cpgs))+
+geom_violin()+
+geom_boxplot(color="black", fill="white", outlier.size=0.7)+
+xlab("")+
+ylab("N CpGs per Probe")+
+theme_bw()
+
+# n CpGs vs Coverage
+ggplot(probeNCpGs, aes(x=n_cpgs, y=mean_cov))+
+geom_point(size=0.7)+
+geom_density2d()+
+xlab("N CpGs")+
+ylab("Mean probe coverage")+
+theme_bw()
+```
+
+Calculate standard deviation and methylation differences per probe
+```{r, warning=FALSE}
+# bring table in long format
+methProbeTrainTable <- as.data.table(methProbes)
+methProbeTrainTable <- melt(methProbeTrainTable,
+                            id.vars=c("probe", "category"))
+
+names(methProbeTrainTable) <- c("probe", "category", 
+                                "sample", "mean_methylation")
+methProbeTrainTable$sample <- as.character(methProbeTrainTable$sample)
+
+# get condition/tissue (cancer vs normal mucosa)
+methProbeTrainTable[,c("patient", "condition"):=tstrsplit(sample, "_")]
+methProbeTrainTable[,tissue:=fifelse(condition=="NM", "NM", "CC")]
+
+# calculate standard deviation per condition/tissue and probe
+methProbeTrainTable[,sd_methylation:=sd(mean_methylation, na.rm=TRUE),
+                    by=c("tissue", "probe")]
+
+# calculate mean sd across condition/tissue
+methProbeTrainTable[,mean_sd_methylation:=mean(sd_methylation), by=c("probe")]
+
+# get cancer probes
+methProbeCCTrainTable <- subset(methProbeTrainTable, tissue=="CC")
+setorder(methProbeCCTrainTable, patient, probe)
+
+# get normal probes
+methProbeNMTrainTable <- subset(methProbeTrainTable, tissue=="NM")
+setorder(methProbeNMTrainTable, patient, probe)
+
+# calculate the methylation difference
+methDiff <- methProbeCCTrainTable$mean_methylation-methProbeNMTrainTable$mean_methylation
+methDiffTable <- data.table(meth_diff=methDiff,
+                            probe=methProbeNMTrainTable$probe,
+                            patient=methProbeCCTrainTable$patient,
+                            condition=methProbeCCTrainTable$condition,
+                            category=methProbeCCTrainTable$category,
+                            mean_sd_methylation_cancer=methProbeCCTrainTable$sd_methylation)
+                            #mean_sd_methylation_normal=methProbeNMTrainTable$sd_methylation,
+                            #methylation_cancer=methProbeCCTrainTable$mean_methylation,
+                            #methylation_normal=methProbeNMTrainTable$mean_methylation)
+
+methProbeTrainTable <- merge(methProbeTrainTable, 
+                             methDiffTable[,c("meth_diff", "patient", "probe"),
+                                              #"mean_sd_methylation_cancer", "mean_sd_methylation_normal"), 
+                                             with=FALSE], 
+                             by=c("patient", "probe"))
+methProbeTrainTable[,median_methylation_diff:=median(meth_diff, na.rm=TRUE),
+                    by=c("probe")]
+```
+
+Plot SD of probes across patients. SD calculated per condition (cancer/NM) and both SDs are averaged per probe.
+```{r}
+ggplot(methProbeTrainTable, aes(x=median_methylation_diff, 
+                                y=mean_sd_methylation,
+                                color=category))+
+geom_point(size=0.01)+
+theme_bw()+
+xlab("Methylation Difference")+
+ylab("Methylation SD (per condition)")+
+guides(colour = guide_legend(override.aes = list(size=2)))+
+theme_ipsum()
+ggsave("./plots/probe_differences_sd.png", width=8, height=5)
+
+#methProbeTrainTable[,tissue:=fifelse(tissue=="CC", "adenoma", "nm")]
+ggplot(methProbeTrainTable, aes(x=median_methylation_diff, 
+                                y=sd_methylation,
+                                color=category))+
+geom_point(size=0.01)+
+theme_bw()+
+facet_grid(cols=vars(tissue))+
+xlab("Methylation Difference")+
+ylab("Methylation SD (per condition)")+
+guides(colour = guide_legend(override.aes = list(size=2)))+
+theme_ipsum()
+ggsave("./plots/probe_differences_sd_facetted.png", width=12, height=5)
+```
+
+## Heatmap 
+
+Patient x probes heatmap
+```{r}
+# Read metadata
+meta <- subset(meta, sample %in% trainSamples)
+meta$condition <- factor(meta$condition, c("NM","cADN","SSL"))
+
+allCategories <- unique(methProbes$category)
+drawHm(meta, methProbes, allCategories)
+svg(filename="./plots/methylation_level_hm_train.svg", width = 10, height = 15)
+dev.off()
+```
+
+Heatmap of methylation differences per probe x patient. Patients ordered by mean methylation difference.
+Probes ordered by sd within the cancer sample.
+```{r}
+setorder(methDiffTable, condition, mean_sd_methylation_cancer)
+patients <- unique(methDiffTable$patient)
+meanDiffPatient <- methDiffTable[,.(mean_methylation_patient=mean(meth_diff, na.rm=TRUE)), 
+                                 by=c("patient")]$mean_methylation_patient
+ord <- order(meanDiffPatient)
+
+methDiffTable$patient <- factor(methDiffTable$patient, 
+                                levels=patients[ord])
+
+ggplot(methDiffTable, aes(patient, as.factor(probe), fill=meth_diff)) + 
+                      geom_tile(colour = "black", size=0.01)+
+    scale_fill_viridis(option="inferno",
+                       alpha=0.9,
+                       guide=guide_colourbar(title="Difference in mean methylation"))+
+    facet_grid(rows=vars(category), cols=vars(condition), 
+               scales="free", space="free_y")+
+    scale_x_discrete(position = "bottom")+
+    ylab("Probes")+
+    theme_minimal()+
+    theme(axis.text.y = element_blank(),
+          axis.text.x = element_text(angle=60, hjust=1),
+          axis.title.x = element_blank(),
+          panel.spacing = unit(0.5, "lines"),
+          strip.background.x=element_rect(color="black", fill=NA, linetype="solid"),
+          #strip.background.y=element_rect(color="black", fill=NA, linetype="solid"),
+          #axis.title.y =element_blank(),
+          strip.text.y = element_text(angle = 360, face="bold"),
+          strip.text.x=element_text(face="bold"))
+
+ggsave("./plots/heatmap_meth_diff_train.svg", units=c("cm"),
+       width=30, height=20)
+```
+
+The samples S3, S5, A3 show very little difference on the probe level, hence they are here compared on the per CpG-level
+```{r, outliers}
+methOutliers <- methFracCpG[, c(grep("S5", colnames(methFracCpG), fixed=TRUE), 
+                                grep("S3", colnames(methFracCpG), fixed=TRUE),
+                                grep("A3_NM", colnames(methFracCpG), fixed=TRUE),
+                                grep("A3_cADN", colnames(methFracCpG), fixed=TRUE))]
+methOutliers <- as.data.table(methOutliers)
+methOutliers$CpG <- 1:nrow(methOutliers)
+methOutliers <- melt(methOutliers, id.vars=c("CpG"))
+setnames(methOutliers, c("variable", "value"), c("sample", "meth_fraction"))
+methOutliers[,patient:=tstrsplit(sample, split="_", keep=1)]
+
+outlierPlot <- ggplot(methOutliers, aes(as.factor(CpG), sample, fill=meth_fraction)) + 
+                      geom_tile(size=0)+
+    scale_fill_viridis(option="inferno",
+                       alpha=0.9,
+                       guide=guide_colourbar(title="Methylated Fraction"))+
+    facet_grid(rows=vars(patient), scales="free", space="free_y")+
+    scale_x_discrete(position = "bottom")+
+    ylab("Samples")+
+    theme_minimal()+
+    theme(#axis.text.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          panel.spacing = unit(0.5, "lines"),
+          strip.background.x=element_rect(color="black", fill=NA, linetype="solid"),
+          #strip.background.y=element_rect(color="black", fill=NA, linetype="solid"),
+          #axis.title.y =element_blank(),
+          strip.text.y = element_text(angle = 360, face="bold"),
+          strip.text.x=element_text(face="bold"))
+
+ggsave("./plots/outliersPerCpG.svg", units=c("cm"),
+       width=20, height=15)
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```
+

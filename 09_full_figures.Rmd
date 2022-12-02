@@ -1,0 +1,226 @@
+---
+title: "10 final figures"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(RColorBrewer)
+  library(ggrepel)
+  library(GenomicRanges)
+  library(stringr)
+  library(RColorBrewer)
+  library(rtracklayer)
+  library(dplyr)
+  library(ComplexHeatmap)
+  library(viridis)
+  library(bsseq)
+  library(hrbrthemes)
+  library(limma)
+  source("utils.R")})
+
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+All code used for the MDS-plot and the heatmaps with all samples (train+test).
+
+# Overview Figures
+
+Read the data: 
+```{r, data import}
+bismarkBSseqTrain <- readRDS("./data/bismarkBSseq_train_ids.rds")
+bismarkBSseqTest <- readRDS("./data/bismarkBSseq_test_ids.rds")
+metaTrain <- pData(bismarkBSseqTrain)
+metaTest <- pData(bismarkBSseqTest)
+
+meta <- rbind(metaTrain, metaTest)
+
+meta$condition <- factor(meta$condition, c("NM","cADN","SSL"))
+```
+
+Combine train and test data into one matrix
+```{r, combine data}
+# Probe meta data
+probAnnot <- readRDS("./meta_data/probeAnnot.rds")
+probeRegions <- makeGRangesFromDataFrame(as.data.frame(probAnnot), 
+                                         keep.extra.columns=TRUE)
+
+# Get per probe methylation levels
+methProbesTrain <- as.data.table(bsseq::getMeth(bismarkBSseqTrain, 
+                                 regions=probeRegions, 
+                                 type="raw", what="perRegion"))
+methProbesTest <- as.data.table(bsseq::getMeth(bismarkBSseqTest, 
+                                 regions=probeRegions, 
+                                 type="raw", what="perRegion"))
+
+# Get sample names
+colnames(methProbesTrain) <- as.character(colData(bismarkBSseqTrain)$sample)
+colnames(methProbesTest) <- as.character(colData(bismarkBSseqTest)$sample)
+
+# Merge into one object
+methProbes <- cbind(methProbesTrain, methProbesTest)
+allSamples <- c(colnames(methProbesTrain), colnames(methProbesTest))
+
+# Annotate the probes 
+probAnnot[grepl("cADN", methylated_in) & grepl("SSL", methylated_in),]$methylated_in="cADN and SSL specific markers"
+probAnnot$methylated_in <- factor(probAnnot$methylated_in, 
+                                  levels=c("Control regions",
+                                           "Age dependent markers",
+                                           "cADN markers",
+                                           "SSL markers",
+                                           "cADN and SSL specific markers"), 
+                                  ordered=TRUE)
+
+methProbes$category <- probAnnot$methylated_in
+methProbes$probe <- probAnnot$probe
+```
+
+## MDS-Plot
+
+```{r, mds plot}
+# Remove probes that are "Age dependent DMRs" and "tumors and normal mucosa"
+methProbesSub <- methProbes[!methProbes$category %in% c("Age dependent markers", 
+                                                        "control regions"),]
+
+# Choose only methylation values from this table
+methProbesSub <- methProbesSub[,c(allSamples), with=FALSE]
+dim(methProbesSub)
+
+# Transform methylation values for the MDS plot
+methsTR <- asin(2*as.matrix(methProbesSub)-1)
+
+# Calculate components for 2-dimension MDS plot
+#as a rule of thumb, I choose the top 10% of the total
+m2 <- limma::plotMDS(methsTR, dim.plot=c(1,2), top = 100, labels = colnames(methsTR))[c("x", "y")]
+m2 <- as.data.frame(m2)
+colnames(m2) <- c("MDS1","MDS2")
+m2 <- as.data.table(m2)
+head(m2)
+
+# Add tissue and sample name to information to m2
+m2$sample <- colnames(methsTR)
+m2[,tissue:=tstrsplit(sample, "_", keep=2)]
+head(m2)
+
+# MDS plot
+ggplot(m2) + 
+  geom_point(aes(x = MDS1, y=MDS2, color = tissue), size=3, alpha=0.8) +
+  scale_color_brewer(palette="Set2")+
+  theme_minimal() +
+  labs(title="MDS",
+       subtitle="top 100 probes with largest standard deviations",
+       x="MDS 1",
+       y="MDS 2")
+ggsave("./plots/mds_points_ids_full.svg")
+```
+
+## Heatmap Methylation level
+
+```{r, heatmap methylation level}
+hm <- drawHm(meta, methProbes, colMeanCategory=c("cADN and SSL specific markers"))
+svg(filename="./plots/methylation_level_hm_full.svg", width = 16, height = 7.5)
+#png(filename="./plots/methylation_level_hm_full.png", width=20, height=7.5, units="in",res=500)
+draw(hm)
+dev.off()
+```
+
+## Heatmap Methylation differences
+
+Calculate standard deviation and methylation differences per probe
+```{r, sd and devation calculation}
+# bring table in long format
+methProbeTable <- as.data.table(methProbes)
+methProbeTable <- melt(methProbeTable,
+                       id.vars=c("probe", "category"))
+
+names(methProbeTable) <- c("probe", "category", 
+                           "sample", "mean_methylation")
+methProbeTable$sample <- as.character(methProbeTable$sample)
+
+# get condition/tissue (cancer vs normal mucosa)
+methProbeTable[,c("patient", "condition"):=tstrsplit(sample, "_")]
+methProbeTable[,tissue:=fifelse(condition=="NM", "NM", "CC")]
+
+# calculate standard deviation per condition/tissue and probe
+methProbeTable[,sd_methylation:=sd(mean_methylation, na.rm=TRUE),
+                by=c("tissue", "probe")]
+
+# calculate mean sd across condition/tissue
+methProbeTable[,mean_sd_methylation:=mean(sd_methylation), by=c("probe")]
+
+# get cancer probes
+methProbeCCTable <- subset(methProbeTable, tissue=="CC")
+setorder(methProbeCCTable, patient, probe)
+
+# get normal probes
+methProbeNMTable <- subset(methProbeTable, tissue=="NM")
+setorder(methProbeNMTable, patient, probe)
+
+# calculate the methylation difference
+methDiff <- methProbeCCTable$mean_methylation-methProbeNMTable$mean_methylation
+methDiffTable <- data.table(meth_diff=methDiff,
+                            probe=methProbeNMTable$probe,
+                            patient=methProbeCCTable$patient,
+                            condition=methProbeCCTable$condition,
+                            category=methProbeCCTable$category,
+                            mean_sd_methylation_cancer=methProbeCCTable$sd_methylation)
+
+methProbeTable <- merge(methProbeTable, 
+                        methDiffTable[,c("meth_diff", "patient", "probe"),
+                                      with=FALSE], 
+                             by=c("patient", "probe"))
+methProbeTable[, median_methylation_diff:=median(meth_diff, na.rm=TRUE),
+                 by=c("probe")]
+```
+
+Methylation level difference heatmap: 
+```{r, heatmap methylation differences}
+setorder(methDiffTable, condition, mean_sd_methylation_cancer)
+patients <- unique(methDiffTable$patient)
+meanDiffPatient <- methDiffTable[,.(mean_methylation_patient=mean(meth_diff, na.rm=TRUE)), 
+                                 by=c("patient")]$mean_methylation_patient
+ord <- order(meanDiffPatient)
+
+methDiffTable$patient <- factor(methDiffTable$patient, 
+                                levels=patients[ord])
+
+ggplot(methDiffTable, aes(patient, as.factor(probe), fill=meth_diff)) + 
+                      geom_tile(colour = "black", size=0.01)+
+    scale_fill_viridis(option="inferno",
+                       alpha=0.9,
+                       guide=guide_colourbar(title="Difference in mean methylation"))+
+    facet_grid(rows=vars(category), cols=vars(condition), 
+               scales="free", space="free_y")+
+    scale_x_discrete(position = "bottom")+
+    ylab("Regions")+
+    theme_minimal()+
+    theme(axis.text.y = element_blank(),
+          axis.text.x = element_text(angle=60, hjust=1),
+          axis.title.x = element_blank(),
+          panel.spacing = unit(0.5, "lines"),
+          strip.background.x=element_rect(color="black", fill=NA, linetype="solid"),
+          strip.text.y = element_text(angle = 360, face="bold"),
+          strip.text.x=element_text(face="bold"))
+
+ggsave("./plots/heatmap_meth_diff_full.png", units=c("cm"),
+       width=37, height=20, dpi=200)
+ggsave("./plots/heatmap_meth_diff_full.svg", units=c("cm"),
+       width=37, height=20, dpi=200)
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```

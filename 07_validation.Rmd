@@ -1,0 +1,481 @@
+---
+title: "07 Validation-plots"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+library(bsseq)
+library(data.table)
+library(FDb.InfiniumMethylation.hg19)
+library(rtracklayer)
+library(GEOquery)
+library(ggplot2)
+library(ggrepel)
+library(hrbrthemes)
+library(viridis)
+library(RColorBrewer)
+source("utils.R")})
+
+set.seed(1896)
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+load probe-level statistics
+```{r, select top probes}
+resultsCpG <- readRDS("./data/dmTestCpGs.rds")
+resultsProbes <- readRDS("./data/dmTestProbes.rds")
+topProbes <- readRDS("./data/topProbes.rds")
+probeAnnot <- readRDS("./meta_data/probeAnnot.rds")
+```
+
+Volcano Plot:
+```{r, volcano plot}
+#resultsProbes <- merge(resultsProbes, 
+#                       probeAnnot, 
+#                       by.x=c("master_id"), by.y=c("master_id"),
+#                       all.x=TRUE, all.y=FALSE)
+
+volcanoPlot <- ggplot(resultsProbes, aes(x=log_fc, y=-log10(fdr) , color=methylated_in))+
+               geom_point(size=2)+
+               geom_label_repel(data=subset(resultsProbes, probe_id %in% topProbes$probe_id),
+                                aes(x=log_fc, y=-log10(fdr), label=probe_id), max.overlaps = Inf,
+                                key_glyph = "point")+
+               geom_vline(xintercept=1, linetype="dashed", lwd=0.5, color="red")+
+               geom_vline(xintercept=-1, linetype="dashed", lwd=0.5, color="red")+
+               geom_hline(yintercept=-log10(0.05), linetype="dashed", lwd=0.5, color="black")+
+               scale_color_brewer(palette="Pastel1", name="methylated in")+
+               labs(x="Log FC",
+                    y="-log10 FDR")+
+               theme_ipsum()
+volcanoPlot
+
+ggsave(file="./plots/volcanoPlotTrain.png", volcanoPlot, width=25, height=15, units=c("cm"))
+```
+
+# Validation data
+
+## GSE131013
+
+See script `gse131013_process.Rmd` for processing.
+```{r, load GSE131013 data}
+gse131013 <- readRDS("./data/gse131013.rds")
+setkey(topProbes, seqnames, start, end)
+gse131013CpGs <- foverlaps(gse131013,
+                           topProbes, 
+                           by.x=c("seqnames", "start", "end"),
+                           by.y=c("seqnames", "start", "end"),
+                           type=c("any"),
+                           nomatch=NULL)
+
+gse131013CpGs[,condition:=tstrsplit(sample, "_", keep=2)]
+gse131013CpGs[,cond_bin:=fifelse(condition=="T","T", "NM")]
+
+# Get per probe x sample mean methylation value
+gse131013Probes <- gse131013CpGs[,.(Beta=mean(Beta, na.rm=TRUE)),
+                                    by=c("sample", "probe_id", "cond_bin")]
+
+# Get per sample mean methylation values
+gse131013Sample <- gse131013CpGs[,.(Beta=mean(Beta, na.rm=TRUE)),
+                                    by=c("sample", "cond_bin")]
+gse131013Sample <- subset(gse131013Sample, !is.na(Beta))
+saveRDS(gse131013Sample, "./data/gse131013SampleTopProbes.rds")
+```
+
+## GSE48684
+
+Download data and reshape:
+```{r, load GSE48684 data}
+for (i in 1:10) gc()
+hm450.hg19 <- get450k(genome='hg19')
+probeIds <- names(hm450.hg19)
+hm450.hg19 <- as.data.table(hm450.hg19)
+hm450.hg19$probe_Id <- probeIds
+
+# load series and platform data from GEO
+gset <- getGEO("GSE48684", GSEMatrix =TRUE, getGPL=FALSE)
+gse48684 <- as.data.table(exprs(gset$GSE48684_series_matrix.txt.gz), keep.rownames=TRUE)
+annotGSE48684 <- as.data.table(gset$GSE48684_series_matrix.txt.gz@phenoData@data)
+
+gse48684 <- melt(gse48684, id.vars=c("rn"))
+setnames(gse48684, c("rn", "variable", "value"), c("target_id","sample", "Beta"))
+
+gse48684 <- merge(gse48684, 
+                  hm450.hg19[,c("seqnames", "start", "end", "probe_Id"), with=FALSE],
+                  by.x=c("target_id"),
+                  by.y=c("probe_Id"),
+                  all.x=FALSE, all.y=FALSE)
+
+gse48684 <- merge(gse48684, 
+                  annotGSE48684[,c("geo_accession", "disease status:ch1"), with=FALSE],
+                  by.x=c("sample"),
+                  by.y=c("geo_accession"))
+
+setnames(gse48684, c("disease status:ch1"), c("condition"))
+saveRDS(gse48684, "./data/gse48684.rds")
+```
+
+Get methylation rates of probes: 
+```{r, methylation level probes GSE48684}
+for (i in 1:10) gc()
+
+# Overlap with top probes
+setkey(topProbes, seqnames, start, end)
+gse48684CpGs <- foverlaps(gse48684,
+                          topProbes, 
+                          by.x=c("seqnames", "start", "end"),
+                          by.y=c("seqnames", "start", "end"),
+                          type=c("any"),
+                          nomatch=NULL)
+
+for (i in 1:10) gc()
+
+# label (tumor vs non-mucosa)
+gse48684CpGs[,cond_bin:=fifelse(grepl("normal",condition),"NM", "T")]
+
+# Get per probe x sample mean methylation value
+gse48684Probes <- gse48684CpGs[,.(Beta=mean(Beta, na.rm=TRUE)),
+                                by=c("sample", "cond_bin", "probe_id")] # , "disease status:ch1", probe_id
+
+# Get per sample mean methylation values
+gse48684Sample <- gse48684CpGs[,.(Beta=mean(Beta, na.rm=TRUE)),
+                                by=c("sample", "cond_bin")] # , "disease status:ch1", probe_id
+gse48684Sample <- subset(gse48684Sample, !is.na(Beta))
+saveRDS(gse48684Sample, "./data/gse48684SampleTopProbes.rds")
+```
+
+## Training set 
+```{r, load training set}
+bismarkBSseqTrain <- readRDS("./data/bismarkBSseq_train_ids.rds")
+topProbesRanges <- makeGRangesFromDataFrame(as.data.frame(topProbes))
+seqlevelsStyle(topProbesRanges) <- "NCBI"
+
+# Get the methylated fraction per probe
+metTrain <- bsseq::getMeth(bismarkBSseqTrain, regions=topProbesRanges, 
+                    type="raw", what="perRegion")
+rownames(metTrain) <- topProbes$probe_id
+
+# reshape the data & annotate
+metTrain <- as.data.table(metTrain, keep.rownames="probe_id")
+colnames(metTrain) <- c("probe_id", as.character(pData(bismarkBSseqTrain)$sample))
+
+metTrain <- melt(metTrain, id.vars=c("probe_id"), 
+                           variable.name="sample",
+                           value.name="met_frac")
+
+# label the samples
+metTrain[,c("patient", "type"):=tstrsplit(sample, "_")]
+metTrain[,cond_bin:=fifelse(type=="NM", "NM", "T")]
+
+# Get per sample mean methylation values
+metTrainSample <- metTrain[,.(met_frac=mean(met_frac, na.rm=TRUE)), 
+                              by=c("sample", "cond_bin")]
+
+metTrainSample <- subset(metTrainSample, !is.na(met_frac))
+```
+
+## Test set
+
+```{r, load test set}
+bismarkBSseqTest <- readRDS("./data/bismarkBSseq_test_ids.rds")
+topProbesRanges <- makeGRangesFromDataFrame(as.data.frame(topProbes))
+seqlevelsStyle(topProbesRanges) <- "NCBI"
+
+# Get the methylated fraction per probe
+metTest <- bsseq::getMeth(bismarkBSseqTest, regions=topProbesRanges, 
+                   type="raw", what="perRegion")
+rownames(metTest) <- topProbes$probe_id
+
+# reshape the data & annotate
+metTest <- as.data.table(metTest, keep.rownames="probe_id")
+colnames(metTest) <- c("probe_id", as.character(pData(bismarkBSseqTest)$sample))
+
+metTest <- melt(metTest, id.vars=c("probe_id"), 
+                         variable.name="sample",
+                         value.name="met_frac")
+
+# label the samples
+metTest[,c("patient", "type"):=tstrsplit(sample, "_")]
+metTest[,cond_bin:=fifelse(type=="NM", "NM", "T")]
+
+# Get per sample mean methylation values
+metTestSample <- metTest[,.(met_frac=mean(met_frac, na.rm=TRUE)), by=c("sample", "cond_bin")]
+metTestSample <- subset(metTestSample, !is.na(met_frac))
+```
+
+## Stratification by probes
+
+```{r, roc}
+gse48684Sample$dataset <- "GSE48684"
+gse131013Sample$dataset <- "GSE131013"
+cols <- c("sample", "Beta", "cond_bin", "dataset")
+
+extDataSamples<- rbind(gse48684Sample[,cols,with=FALSE], 
+                       gse131013Sample[,cols,with=FALSE])
+
+extDataRoc <- getRocs(extDataSamples, scores="Beta", models="dataset",
+                      labels="cond_bin", posClass="T", negClass="NM", 
+                      subSample=FALSE)
+
+metTestSample$dataset <- "test set"
+metTestRoc <- getRocs(metTestSample, scores="met_frac", models="dataset",
+                      labels="cond_bin", posClass="T", negClass="NM",
+                      subSample=FALSE)
+
+rocs <- rbindlist(list(extDataRoc, metTestRoc), use.names=TRUE, fill=TRUE)
+aucDatasets <- rocs[,.(auc=unique(auc_mod)),
+                       by=c("dataset")]
+
+rocPlot <- ggplot(rocs,  aes(fpr, tpr, colour=dataset))+
+  #scale_x_sqrt()+ 
+  scale_color_brewer(palette="Dark2")+
+  geom_text(x=0.75, 
+                   y=c(0.1,0.3,0.5), 
+           data=aucDatasets, 
+           aes(colour=dataset, label=paste("AUC:", round(auc, 3))))+
+  geom_line(aes(group=dataset), alpha=0.7, size=1.7)+
+  labs(title="Validation datasets",
+       subtitle="top DM Probes",
+       x="False Positive Rate",
+       y="True Positive Rate")+
+  theme_ipsum(axis_title_size=12)
+rocPlot
+
+ggsave(file="./plots/rocPlotTest.png", rocPlot, width=20, height=15, units=c("cm"))
+```
+
+Heatmap of the top probes (for the matched samples)
+```{r, top probes heatmap}
+# Annotate (matched) datasets
+gse131013Probes$dataset <- "GSE131013"
+metTest$dataset <- "test set"
+metTrain$dataset <- "train set"
+
+# Combine
+setnames(gse131013Probes, c("Beta"), c("met"))
+setnames(metTest, c("met_frac"), c("met"))
+setnames(metTrain, c("met_frac"), c("met"))
+
+cols <- c("probe_id", "sample", "met", "dataset", "cond_bin")
+allMetProbes <- rbindlist(list(gse131013Probes, 
+                               metTrain[,cols,with=FALSE],
+                               metTest[,cols, with=FALSE]), 
+                          use.names=TRUE)
+
+allMetProbes[,patient:=tstrsplit(sample, split="_", keep=1)]
+
+# Calculate Methylation differences
+allMetProbesCancer <- subset(allMetProbes, cond_bin=="T")
+allMetProbesNormal <- subset(allMetProbes, cond_bin=="NM")
+
+allMetProbesDiff <- merge(allMetProbesCancer,
+                          allMetProbesNormal,
+                          by=c("patient", "probe_id", "dataset"),
+                          suffixes=c(".cancer", ".normal"))
+allMetProbesDiff[,diff:=met.cancer-met.normal]
+
+# order Patients
+meanDiffPatient <- allMetProbesDiff[,.(mean_methylation_patient=mean(diff, na.rm=TRUE)), 
+                                       by=c("patient")]$mean_methylation_patient
+ordPatients <- order(meanDiffPatient)
+patients <- unique(allMetProbesDiff$patient)
+allMetProbesDiff$patient <- factor(allMetProbesDiff$patient, 
+                                   levels=patients[ordPatients])
+
+# order probes
+allMetProbesDiff$probe_id <- factor(allMetProbesDiff$probe_id, 
+                                    levels=topProbes$probe_id)
+
+# order datasets
+allMetProbesDiff$dataset <- factor(allMetProbesDiff$dataset, 
+                                   levels=c("train set", "test set", 
+                                            "GSE131013"))
+allMetProbesDiff$probe_type <- "single probes"
+
+# add annotation layer with global methylation difference 
+# the probe panel (i.e. per patient)
+allMetSamplesDiff <- allMetProbesDiff[,.(mean_met_diff=mean(diff, na.rm=TRUE)),
+                                         by=c("patient", "dataset")]
+allMetSamplesDiff$probe_id <- "all"
+allMetSamplesDiff$probe_type <- "panel"
+allMetSamplesDiffNeg <- subset(allMetSamplesDiff, mean_met_diff<=0)
+
+heatmapProbes <- ggplot(allMetProbesDiff, aes(patient, probe_id, fill=diff)) + 
+                      geom_tile(colour = "black", size=0.01)+
+    scale_fill_viridis(option="inferno",
+                       alpha=0.9,
+                       guide=guide_colourbar(title="Methylation difference Probe"))+
+    facet_grid(cols=vars(dataset), scales="free", 
+               rows=vars(probe_type), space="free")+
+    scale_x_discrete(position = "bottom")+
+    ylab("Top 30 probes")+
+    geom_point(data=allMetSamplesDiff, 
+               size=2,
+               aes(x=patient, y=probe_id, 
+                   fill=mean_met_diff, 
+                   color=mean_met_diff))+
+    geom_tile(data=allMetSamplesDiffNeg, 
+              color="darkred", fill=NA, na.value = NA, alpha=0, size=0.5)+
+    scale_color_viridis(option="viridis",
+                       alpha=0.9,
+                       guide=guide_colourbar(title="Methylation difference Panel"))+
+    theme_ipsum()+
+    theme(axis.text.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          panel.spacing = unit(0.5, "lines"),
+          strip.background.x=element_rect(color="black", fill=NA, linetype="solid"),
+          #strip.background.y=element_rect(color="black", fill=NA, linetype="solid"),
+          #axis.title.y =element_blank(),
+          strip.text.y = element_text(angle = 360, face="bold"),
+          strip.text.x=element_text(face="bold"))
+heatmapProbes
+
+ggsave(file="./plots/heatmapTopProbesTotal.svg", 
+       heatmapProbes, width=40, height=15, units=c("cm"))
+```
+Paired-sample ROC curves (?)
+
+Show direction of methylation of the top probes
+```{r, methylation change direction plot}
+setnames(metTrainSample, "met_frac", "met")
+setnames(metTestSample, "met_frac", "met")
+setnames(gse131013Sample, "Beta", "met")
+
+# Combine
+metTrainSample$dataset <- "train set"
+allPairedSamples <- rbindlist(list(metTrainSample,
+                                   metTestSample,
+                                   gse131013Sample), use.names=TRUE)
+
+# Annotate
+allPairedSamples[,patient:=tstrsplit(sample, split="_", keep=1)]
+allPairedSamples[,cond_bin:=fifelse(cond_bin=="NM", "normal", "adenoma")]
+
+# Define order
+allPairedSamples <- merge(allPairedSamples,
+                          allMetSamplesDiff[,c("patient", "mean_met_diff"), with=FALSE],
+                          by=c("patient"))
+allPairedSamples$patient <- factor(allPairedSamples$patient,
+                                   levels=patients[ordPatients])
+
+# add ranges
+allPairedSamples[,min_cond:=cond_bin[which.min(met)], by=c("patient")]
+allPairedSamples[,min_met:=min(met), by=c("patient")]
+allPairedSamples[,max_met:=max(met), by=c("patient")]
+allPairedSamples[,type:=fifelse(min_cond=="normal", "hyper", "hypo")]
+
+# Define colors to be plotted for conditions
+colorsConds <- brewer.pal(n=3,name="Set2")[1:2]
+conds <- c("normal", "adenoma")
+names(colorsConds) <- conds
+
+# Define colors to be plotted for ranges
+colorDirection <- c("lightgray", "darkred")
+directions <- c("hyper", "hypo")
+names(colorDirection) <- directions
+
+# Define order of datasets
+allPairedSamples$dataset <- factor(allPairedSamples$dataset,
+                                   levels=c("train set", "test set", "GSE131013"))
+
+dirPlot <- ggplot(allPairedSamples, aes(x=patient, y=met, fill=cond_bin))+
+           facet_grid(cols=vars(dataset), scale="free_x", space="free_x")+
+           geom_linerange(aes(ymin=min_met,ymax=max_met, color=type), size=0.5)+
+           geom_point(pch=21, color="black")+
+           scale_fill_manual(values=colorsConds, breaks=names(colorsConds),
+                             guide=guide_legend(title="condition"))+
+           scale_color_manual(values=colorDirection, breaks=names(colorDirection),
+                              guide=guide_legend(title="direction"))+
+           #scale_size_manual(values=alphaValues)+
+           labs(x="individual",
+                y="methylation (panel)")+
+            theme_ipsum()+
+            theme(axis.text.x=element_blank(),
+                  axis.ticks.x=element_blank(),
+                  panel.grid.major.x=element_blank())
+dirPlot
+
+ggsave(file="./plots/topProbesDirections.svg", 
+       dirPlot, width=30, height=15, units=c("cm"))
+ggsave(file="./plots/topProbesDirections.png", 
+       dirPlot, width=30, height=15, units=c("cm"))
+```
+
+```{r, combine probes plot}
+library(patchwork)
+patchworkPlot = heatmapProbes/dirPlot
+patchworkPlot[[2]] = patchworkPlot[[2]] + theme(strip.text.x = element_blank())
+patchworkPlot
+
+ggsave(file="./plots/topProbesFull.svg", 
+       patchworkPlot, width=40, height=25, units=c("cm"))
+ggsave(file="./plots/topProbesFull.png", 
+       patchworkPlot, width=40, height=25, units=c("cm"))
+```
+Relative risk scores: 
+```{r, relative risk scores}
+sampleInfo <- colData(bismarkBSseqTest)
+sampleInfo <- as.data.table(sampleInfo)
+typeCounts <- sampleInfo[,.(n_type=.N), by=c("condition")]
+
+# relative per probe risk scores
+metTestPl <- subset(metTest, type!="NM")
+metTestNM <- subset(metTest, type=="NM")
+cols <- c("patient", "probe_id", "met")
+
+metTestPatient <- merge(metTestPl[, cols, with=FALSE], 
+                        metTestNM[, cols, with=FALSE], 
+                        by=c("patient", "probe_id"))
+setnames(metTestPatient, c("met.x", "met.y"), c("met_pl", "met_nm"))
+metTestPatient[,relative_risk:=met_pl/met_nm]
+
+min(metTestPatient$relative_risk, na.rm=TRUE)
+max(metTestPatient$relative_risk, na.rm=TRUE)
+```
+
+# Probe ranking
+
+```{r, ordering probes}
+resultsProbes <- resultsProbes[order(fdr),]
+write.table(resultsProbes, file="./data/probeRanking.csv", quote=FALSE,
+            sep=",", eol="\r", row.names=FALSE)
+```
+
+Comparison to cologuard probes
+```{r, ranking probes}
+resultsProbes$rank <- 1:nrow(resultsProbes)
+
+# rank cologuard markers
+# probe_id %in% c(944, 383)
+cologuardRanks <- subset(resultsProbes, grepl("944", master_id) | grepl("383", master_id))
+write.table(cologuardRanks, file="./data/cologuardRanks.csv", quote=FALSE,
+            sep=",", eol="\r", row.names=FALSE)
+knitr::kable(cologuardRanks, "simple")
+```
+
+# CpG Ranking
+
+```{r, ranking cpgs}
+resultsCpG <- subset(resultsCpG, method=="Voom+Limma")
+resultsCpG <- resultsCpG[order(adj_p_values),]
+
+# add CpG coordinate from illumina
+write.table(resultsCpG, file="./data/CpGRanking.csv", quote=FALSE,
+            sep=",", eol="\r", row.names=FALSE)
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```

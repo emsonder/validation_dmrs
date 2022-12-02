@@ -1,0 +1,419 @@
+---
+title: "06 Probe Selection"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(bsseq)
+  library(ggplot2)
+  library(ggthemes)
+  library(data.table)
+  library(gtools)
+  library(plotROC)
+  library(hrbrthemes)
+  library(viridis)
+  library(RColorBrewer)
+  library(gridExtra)
+  library(ggnewscale)
+  library(ggpubr)
+  library(GenomicRanges)
+  library(pROC)
+  library(cutpointr)
+  library(QCSIS)
+  source("utils.R")})
+
+set.seed(1896)
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+# Data Import
+
+```{r, data import}
+bismarkBSseqTrain <- readRDS("./data/bismarkBSseq_train_ids.rds")
+probeAnnot <- readRDS("./meta_data/probeAnnot.rds")
+probeRanges <- makeGRangesFromDataFrame(probeAnnot, keep.extra.columns=TRUE)
+
+dmTestProbes <- readRDS("./data/dmTestProbes.rds")
+dmTestCpGs <- readRDS("./data/dmTestCpGs.rds")
+```
+
+```{r}
+# select top 30 probes, i.e. the panel
+topProbes <- dmTestProbes[, .SD[head(order(fdr), 30)]]
+```
+
+# DM Probe Testing
+
+Heatmap top 30 probes:
+```{r, heatmap top probes}
+methMatProbes <- bsseq::getMeth(bismarkBSseqTrain, regions=probeRanges,
+                                what="perRegion", type="raw")
+
+colnames(methMatProbes) <- colData(bismarkBSseqTrain)$sample
+methMatProbes <- as.data.table(methMatProbes)
+methMatProbes <- cbind(methMatProbes, probeAnnot)
+
+methProbes <- melt(methMatProbes, 
+                   id.vars=colnames(probeAnnot),
+                   variable.name="sample", 
+                   value.name="meth_level")
+methProbes[,c("patient", "condition"):=tstrsplit(sample, "_")]
+
+# make heatmap for both
+methProbesNm <- subset(methProbes, condition=="NM")
+methProbesPl <- subset(methProbes, condition!="NM")
+methProbesDiff <- merge(methProbesNm,
+                        methProbesPl[,c("patient", "probe", "meth_level"), with=FALSE],
+                        by=c("probe", "patient"))
+setnames(methProbesDiff, c("meth_level.y", "meth_level.x"), 
+                         c("meth_level_pl", "meth_level_nm"))
+methProbesDiff[, meth_level_diff:=meth_level_pl-meth_level_nm]
+
+methProbesDiffTop <- merge(methProbesDiff, 
+                           topProbes,
+                           by.x=c("probe"), by.y=c("probe_id"))
+
+setorder(methProbesDiffTop, fdr)
+methProbesDiffTop$probe <- factor(methProbesDiffTop$probe, 
+                                  levels=unique(methProbesDiffTop$probe), ordered=TRUE)
+
+methProbesDiffTop[,mean_diff:=mean(meth_level_diff), by=c("patient")]
+setorder(methProbesDiffTop, mean_diff)
+methProbesDiffTop$patient <- factor(methProbesDiffTop$patient, 
+                                  levels=unique(methProbesDiffTop$patient), 
+                                  ordered=TRUE)
+  
+heatmapProbes <- ggplot(methProbesDiffTop, aes(patient, probe, fill=meth_level_diff)) + 
+                 geom_tile(colour = "black", size=0.01)+
+                 scale_fill_viridis(option="inferno",
+                                    alpha=0.9,
+                                    guide=guide_colourbar(title="Difference in mean methylation"))+
+                scale_x_discrete(position = "bottom")+
+                ylab("Top 30 probes")+
+                theme_minimal()+
+                theme(axis.text.y = element_blank(),
+                      axis.text.x = element_text(angle=60, hjust=1),
+                      axis.title.x = element_blank(),
+                      panel.spacing = unit(0.5, "lines"),
+                      strip.background.x=element_rect(color="black", 
+                                                      fill=NA, linetype="solid"),
+                strip.text.y = element_text(angle = 360, face="bold"),
+                strip.text.x=element_text(face="bold"))
+heatmapProbes
+
+ggsave(file="./plots/heatmapTopProbes.png", heatmapProbes, width=20, height=12, units=c("cm"))
+```
+
+ROC Curve Top Probe Sets: 
+```{r, rocs random markers}
+nSims <- 100
+nProbesSet <- c(3,5,10,30,50)
+rocsRandom <- list()
+aucsRandom <- list()
+probesPl <- subset(probeAnnot, methylated_in=="cADN and SSL specific markers")
+methProbes[,class:=fifelse(condition=="NM", "NM", "PL")]
+
+for(n in nProbesSet)
+{
+  for(i in 1:nSims)
+  {
+    # select random probes
+    probRandomSub <- probesPl[sample(1:nrow(probesPl), n),]
+    methRandProbes <- subset(methProbes, probe %in% probRandomSub$probe)
+    methRandProbes[,class:=fifelse(condition=="NM", "NM", "PL")]
+    
+    methRandProbes <- methRandProbes[,.(mean_meth_level=mean(meth_level),
+                                       class=unique(class)),
+                                     by=sample]
+    methRandProbes$randSet <- paste("random:", n)
+    
+    rocRandom <- getRocs(methRandProbes, scores="mean_meth_level", 
+                         models="randSet", labels="class", 
+                         posClass="PL", negClass="NM", subSample=FALSE)
+    
+    rocRandom$model <- paste("rand", paste(n, i, sep=":"), sep="_")
+    rocsRandom[[paste("rand", paste(n, i, sep=":"), sep="_")]] <- rocRandom
+    
+    aucRandom <- rocRandom[,.(auc=unique(auc_mod))]
+    aucRandom$model <- paste("rand", paste(n, i, sep=":"), sep="_")
+    aucsRandom[[paste("rand", paste(n, i, sep=":"), sep="_")]] <- aucRandom
+  }
+}
+
+rocsRandom <- rbindlist(rocsRandom)
+rocsRandom[,c("rand_n_probes", "sim_i"):=tstrsplit(model, ":")]
+rocsRandom[,c("n_probes"):=tstrsplit(rand_n_probes, "_", keep=2, type.convert=TRUE)]
+#rocsRandom$model <- "Random Markers"
+
+aucsRandom <- rbindlist(aucsRandom, idcol="set")
+aucsRandom[,c("model", "sim_i"):=tstrsplit(set, ":")]
+aucsRandom[,c("n_probes"):=tstrsplit(model, "_", keep=2, type.convert=TRUE)]
+aucsRandom <- aucsRandom[,.(auc=mean(auc)), by=n_probes]
+aucsRandom$model <- "Random Markers"
+```
+
+```{r, rocs top markers}
+nProbesSet <- c(3,5,10,30,50)
+rocsTop <- list()
+aucsTop <- list()
+
+for(n in nProbesSet)
+{
+  topProbes <- dmTestProbes[, .SD[head(order(fdr), n)]]
+  methTopProbes <- subset(methProbes, probe %in% topProbes$probe_id)
+  methTopProbes <- methTopProbes[,.(mean_meth_level=mean(meth_level),
+                                    class=unique(class)),
+                                    by=sample]
+  
+  methTopProbes$model <- paste("Top Markers")
+  rocTop <- getRocs(methTopProbes, scores="mean_meth_level", 
+                    models="model", labels="class", 
+                    posClass="PL", negClass="NM", subSample=FALSE)
+  
+  rocsTop[[n]] <- rocTop
+  aucsTop[[n]] <- rocTop[,.(auc=unique(auc_mod))]
+}
+
+rocsTop <- rbindlist(rocsTop, idcol="n_probes")
+aucsTop <- rbindlist(aucsTop, idcol="n_probes")
+aucsTop$model <- "Top Markers"
+```
+
+<div class="hscroll-plot">
+```{r, roc plot}
+rocs <- rbind(rocsRandom, rocsTop, use.names=TRUE, fill=TRUE)
+aucs <- rbind(aucsRandom, aucsTop, use.names=TRUE, fill=TRUE)
+
+colors <- brewer.pal(1, "Dark2")
+colorMethods <-  c("Top Markers" = colors[1],
+                   "Random Markers"="grey")
+
+colorsRandom <- rep("grey", nSims*length(nProbesSet)+1)
+names(colorsRandom) <- c(unique(rocsRandom$model), "rand")
+colorValues <-  c(colorMethods,
+                  colorsRandom)
+colorAUcs <- c(colorMethods,
+               colorsRandom )
+
+alphaRandom <- rep(0.8, nSims*length(nProbesSet)+1)
+names(colorsRandom) <- c(unique(rocsRandom$model), "rand")
+alphaValues <- c("Top Markers"= 0.9, 
+                 alphaRandom)
+
+sizeRandom <- rep(0.4, nSims*length(nProbesSet)+1)
+sizeValues <- c(1,sizeRandom)
+names(sizeValues) <- c("Top Markers", c(unique(rocsRandom$model), "rand"))
+
+rocs$n_probes <- factor(rocs$n_probes, levels=nProbesSet, ordered=TRUE)
+#rocs$model <- factor(rocs$model, levels=c("Top Markers", "Random Markers"), 
+#                     ordered=TRUE)
+
+aucs$n_probes <- factor(aucs$n_probes, levels=nProbesSet, ordered=TRUE)
+aucs$model <- factor(aucs$model, levels=c("Top Markers", "Random Markers"), 
+                     ordered=TRUE)
+aucs[,label:=paste(model,"AUC:", round(auc, 4))]
+aucs$label <- factor(aucs$label, levels=unique(aucs$label), ordered=TRUE)
+setorder(aucs, label)
+
+
+rocPlot <- ggplot(rocs, aes(fpr, tpr, colour=model, size=model))+ 
+           facet_grid(cols=vars(n_probes))+
+           geom_line(aes(group=model, alpha=model))+
+           scale_color_manual(values=colorValues, breaks=names(colorValues))+
+           scale_alpha_manual(values=alphaValues)+
+           scale_size_manual(values=sizeValues)+
+           geom_text(x=rep(0.50, 10),
+                     y=c(rep(0.75, 5), rep(0.65, 5)), 
+                     size=4,
+                     data=aucs, 
+                     aes(colour=model, label=label))+
+           labs(x="False Positive Rate",
+                y="True Positive Rate")+
+           theme_ipsum(axis_title_size=12)+
+           theme(legend.position="none")
+rocPlot
+
+# add legend (plot some random plot and just get legend)
+models <- names(colorMethods)
+nModels <- length(models)
+p <- ggplot(data.frame(x=rnorm(nModels*10), 
+                       y=rnorm(nModels*10), 
+                       method=rep(models, 10)), 
+            aes(x=x, y=y, color=method))+
+  scale_color_manual(name="marker", values=colorMethods)+
+  geom_line(lwd=1.8)+
+  theme_ipsum(caption_size=16)+
+theme(legend.position="top", 
+      legend.text=element_text(size=12),
+      legend.title=element_text(size=12))
+
+p <- as_ggplot(get_legend(p))
+probesValPlot <- ggarrange(rocPlot, p, nrow=2, heights=c(40,5),
+                          font.label=list(size = 16))
+probesValPlot
+g <- arrangeGrob(probesValPlot)
+
+# Save plots
+ggsave(file="./plots/rocPlotTrain.png", g, width=42, height=12, units=c("cm"))
+ggsave(file="./plots/rocPlotTrain.svg", g, width=42, height=12, units=c("cm"))
+```
+</div>
+
+# Selection of the Probe Panel
+
+```{r, select top probes}
+# select top 30 probes, i.e. the panel
+topProbes <- dmTestProbes[, .SD[head(order(fdr), 30)]]
+
+# load probe annotations
+probeAnnot <- readRDS("./meta_data/probeAnnot.rds")
+probeAnnot[grepl("cADN and SSL", methylated_in), methylated_in:= "cADN and SSL specific markers"]
+
+topProbes <- merge(topProbes,
+                   probeAnnot, 
+                   by.x=c("probe_id"), by.y=c("probe"),
+                   all.x=TRUE, all.y=FALSE)
+
+topProbes[,seqnames:=paste0("chr", seqnames)]
+saveRDS(topProbes, "./data/topProbes.rds") 
+
+# Check Coverage of top probes:
+topProbeRanges <- makeGRangesFromDataFrame(topProbes)
+seqlevelsStyle(topProbeRanges) <- "NCBI"
+covPerRegion <- getCoverage(bismarkBSseqTrain, regions=topProbeRanges,
+                            type="Cov", what=c("perRegionAverage"))
+# minimal average coverage of the selected probes
+min(covPerRegion)
+
+covPerCpG <- getCoverage(bismarkBSseqTrain, regions=topProbeRanges, type="Cov",
+                         what = c("perBase"))
+
+# minimal per CpG coverage of all CpGs within the selected probes
+min(unlist(covPerCpG))
+```
+
+Relative risk scores: 
+```{r, relative risk scores}
+sampleInfo <- colData(bismarkBSseqTrain)
+sampleInfo <- as.data.table(sampleInfo)
+typeCounts <- sampleInfo[,.(n_type=.N), by=c("condition")]
+
+# relative per probe & patient risk scores
+methProbesDiff[,relative_risk:=meth_level_pl/meth_level_nm]
+
+methProbesDiffDMRs <- subset(methProbesDiff, 
+                             !(methylated_in %in% c("Control regions",
+                                                    "SSL markers",
+                                                    "cADN markers",
+                                                    "Age dependent markers")))
+min(methProbesDiffDMRs$relative_risk, na.rm=TRUE)
+max(methProbesDiffDMRs$relative_risk, na.rm=TRUE)
+
+# relative per probe risk scores
+methProbesMeanDiffDMRs <- methProbesDiffDMRs[,.(mean_met_level_pl=mean(meth_level_pl),
+                                                mean_met_level_nm=mean(meth_level_nm)), 
+                                             by=c("probe")]
+methProbesMeanDiffDMRs[, relative_risk_probe:=mean_met_level_pl/mean_met_level_nm]
+min(methProbesMeanDiffDMRs$relative_risk, na.rm=TRUE)
+max(methProbesMeanDiffDMRs$relative_risk, na.rm=TRUE)
+
+
+# FDR range of top probes
+dmTestProbesDMRs <- subset(dmTestProbes, 
+                           !(methylated_in %in% c("Control regions",
+                                                  "SSL markers",
+                                                  "cADN markers",
+                                                  "Age dependent markers")))
+min(-dmTestProbesDMRs$log_fc)
+max(-dmTestProbesDMRs$log_fc)
+
+min(dmTestProbesDMRs$fdr)
+max(dmTestProbesDMRs$fdr)
+```
+
+
+# Selection of optimal threshold
+
+```{r, threshold selection}
+#topProbes <- readRDS("./data/topProbes.rds")
+topProbeRanges <- makeGRangesFromDataFrame(as.data.frame(topProbes))
+seqlevelsStyle(topProbeRanges) <- "NCBI"
+
+# get training data in right format
+metTrain <- bsseq::getMeth(bismarkBSseqTrain, regions=topProbeRanges, 
+                   type="raw", what="perRegion")
+colnames(metTrain) <- as.character(colData(bismarkBSseqTrain)$sample)
+rownames(metTrain) <- topProbes$probe_id
+
+metTrain <- as.data.table(metTrain, keep.rownames="probe_id")
+metTrain <- melt(metTrain, id.vars=c("probe_id"), 
+                         variable.name="sample",
+                         value.name="met_frac")
+
+# label the samples
+metTrain[,c("patient", "type"):=tstrsplit(sample, "_")]
+metTrain[,cond_bin:=fifelse(type=="NM", "NM", "T")]
+
+# Get per sample mean methylation values
+metTrainSample <- metTrain[,.(met_frac=mean(met_frac, na.rm=TRUE)), by=c("sample", "cond_bin")]
+metTrainSample <- subset(metTrainSample, !is.na(met_frac))
+metTrainSample$model <- "top probes"
+
+# get the roc stats
+optCutYouden <- cutpointr(metTrainSample, "met_frac", "cond_bin", direction = ">=", 
+                          pos_class = "T", neg_class = "NM", 
+                          method = maximize_metric, metric = youden)
+optCutYouden$optimal_cutpoint
+
+optCutCkappa <- cutpointr(metTrainSample, "met_frac", "cond_bin", direction = ">=", 
+                            pos_class = "T", neg_class = "NM", 
+                            method = maximize_metric, metric = cohens_kappa)
+optCutCkappa$optimal_cutpoint
+
+optCutF1_score <- cutpointr(metTrainSample, "met_frac", "cond_bin", direction = ">=", 
+                            pos_class = "T", neg_class = "NM", 
+                            method = maximize_metric, 
+                            metric = F1_score)
+optCutF1_score$optimal_cutpoint
+
+falsClass <- subset(metTrainSample, 
+                    (met_frac >= optCutF1_score$optimal_cutpoint & cond_bin=="NM") | 
+                    (met_frac < optCutF1_score$optimal_cutpoint & cond_bin=="T"))
+falsClass
+
+saveRDS(optCutF1_score$optimal_cutpoint, "./meta_data/optimal_cut_point.rds")
+```
+
+```{r, roc plot cut point}
+rocsTopProbes <- getRocs(metTrainSample, scores="met_frac", models="model",
+                         labels="cond_bin", posClass="T", negClass="NM",
+                         subSample=FALSE)
+rocPlot <- ggplot(rocsTopProbes, aes(fpr, tpr, colour=model, size=model))+
+  geom_line()+
+  geom_point(aes(y=optCutYouden$sensitivity, x=1-optCutYouden$specificity), 
+             shape=13, size=7, color="grey", alpha=0.8)+
+  labs(x="False Positive Rate",
+       y="True Positive Rate")+
+  theme_ipsum(axis_title_size=12)+
+  theme(legend.position="none")
+rocPlot
+
+ggsave("./plots/RocPlotOptCutOff.png", rocPlot)
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```
+

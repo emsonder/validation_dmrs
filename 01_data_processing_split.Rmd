@@ -1,0 +1,355 @@
+---
+title: "01 Data processing & split"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+params: 
+  pathCpGReports: ""
+  pathCpGReportsParker: ""
+---
+
+R code to read-in CpG-report files from bismark, filter coverage and train & test split.
+Code from Stephany Orjuela, April 2021, adapted by Emanuel Sonder December 2021
+
+```{r, setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(bsseq)
+  library(rtracklayer)
+  library(dplyr)
+  library(data.table)
+  library(SummarizedExperiment)
+  library(ggplot2)
+  library(ggrepel)
+  library(BiocParallel)
+  library(BSgenome.Hsapiens.UCSC.hg19)
+  library(splitstackshape)
+})
+
+# set seed
+seed <- 42
+set.seed(seed)
+
+# Turn off warnings and messages for knitted document
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                       fig.width=12, fig.height=7) 
+
+# directory cp-report files
+methFilePath <- params$pathCpGReports
+methFileParkerPath <- params$pathCpGReportsParker
+```
+
+Paths:
+```{r, paths}
+# Set main variables
+# Change paths if you move the files to another location
+coverage <- 10
+metadata <- "./meta_data/metaDataId.txt" #file with the paths to the _report.txt files, and sample information
+batchData <- "./meta_data/batchDataId.txt" # information in which sequencing run a sample has been processed
+probes <- "./meta_data/merged_baits.bed" #bed file with probe locations
+mastertab <- "./meta_data/master_probes_table_new.csv" #file with DMRs used for the probe design
+```
+
+# Section 1: Get the probe data 
+
+Import the probe information:
+```{r, probe import}
+# Read probes file (MUST be a bed file)
+prob <- import(probes)
+nProbes <- length(prob)
+seqlevelsStyle(prob) <- "UCSC"
+
+write.csv(prob, file="./data/probes.csv", col.names=TRUE, quote=FALSE)
+
+# Find sequences of the probes
+probCoords <- prob
+end(probCoords) <- end(probCoords)+1
+probSeqs <- getSeq(BSgenome.Hsapiens.UCSC.hg19, probCoords)
+names(probSeqs) <- 1:nProbes
+
+# get the relative positions of CGs within the probes
+probLoci <- vmatchPattern(pattern="CG", subject=probSeqs, algorithm="naive-exact")
+
+# Find the absolute CG positions 
+probLoci <- lapply(1:nProbes, function(i){probe <- unlist(tile(prob[i], width=1)) 
+                                          probe[start(probLoci[[i]])]})
+probLoci <- do.call("c", probLoci)
+seqlevelsStyle(probLoci) <- "NCBI"
+seqlevelsStyle(prob) <- "NCBI"
+prob$probe <- 1:nProbes
+
+# annotate probes
+master <- fread(mastertab, header = TRUE)
+masterRanges <- makeGRangesFromDataFrame(as.data.frame(master))
+seqlevelsStyle(masterRanges) <- "NCBI"
+
+hitsProbeAnnot <- as.data.table(findOverlaps(prob, masterRanges, type="any", 
+                                             ignore.strand=TRUE))
+probAnnot <- as.data.table(prob[hitsProbeAnnot$queryHits])
+probAnnot$master_hit <- hitsProbeAnnot$subjectHits
+
+probAnnot <- merge(probAnnot,
+                   master[,c("Genomic locus", "Methylated in:", "No."), with=FALSE], 
+                   by.x=c("master_hit"), by.y=c("No."))
+setnames(probAnnot, c("Genomic locus", "Methylated in:"), 
+                    c("genomic_locus", "methylated_in"))
+
+probAnnot <- probAnnot[,.(start=unique(start),
+                          end=unique(end),
+                          seqnames=unique(seqnames),
+                          master_id=paste(master_hit, collapse="/"),
+                          genomic_locus=paste(genomic_locus, collapse="/"),
+                          methylated_in=paste(methylated_in, collapse="/")),
+                       by=c("probe")]
+saveRDS(probAnnot, "./meta_data/probeAnnot.rds")
+
+# Annotate probLoci
+lociOverlaps <- as.data.table(findOverlaps(probLoci, prob, type="any"))
+probeLociAnnot <- as.data.table(probLoci)
+probeLociAnnot$probe <- lociOverlaps$subjectHits
+
+probeLociAnnot <- merge(probeLociAnnot,
+                        probAnnot,
+                        suffixes=c("_loci", "_probe"),
+                        by=c("probe"))
+
+# ensure that ordering of the two is the same
+#probeLociAnnot[,c("seqnames_loci", "start_loci", "end_loci")]==as.data.table(probLoci)[,c("seqnames", "start", "end")]
+
+saveRDS(probeLociAnnot, "./meta_data/probeLociAnnot.rds")
+```
+
+# Section 2: train/test split
+
+assemble meta data information (batches SSL/cADN ratios):
+```{r, metadata assembly}
+# Read in metadata
+meta <- fread(metadata, header = TRUE)
+meta[,file:=paste(methFilePath, file_name, sep="/")]
+
+# attribute numeric identifier to patients
+# meta[,patient_id:=as.integer(factor(patient, levels=unique(patientConditions$patient)))]
+
+# get batch information
+batchInfo <- fread(batchData, 
+                   header=TRUE, 
+                   stringsAsFactors=FALSE)
+
+# get cADN/SSL for each patient
+cancerSamples <- subset(meta, condition!="NM")$sample
+patientConditions <- tstrsplit(cancerSamples, "_", keep=c(1,2))
+patientConditions <- data.table(patient_id=patientConditions[[1]],
+                                cancer_condition=patientConditions[[2]],
+                                stringsAsFactors=FALSE)
+
+# annotate with batch info
+patientConditions <- merge(patientConditions, 
+                           batchInfo, 
+                           by=c("patient_id"))
+
+batchCancerRatios <- table(patientConditions$batch, patientConditions$cancer_condition)
+batchInfo <- data.table(batch=rownames(batchCancerRatios),
+                        cADN=batchCancerRatios[,1],
+                        SSL=batchCancerRatios[,2])
+
+batchInfo[,batch_size:=cADN+SSL]
+
+# Do some rough binning on the ssl ratios
+batchInfo[,SSL_ratio:=SSL/cADN]
+batchInfo[,SSL_ratio_bin:=fifelse(SSL_ratio>=1.0, "high", "low")]
+#batchInfo[,SSL_ratio_bin:=fifelse(SSL_ratio>=0.5 & SSL_ratio<1.0, "Med", SSL_ratio_bin)]
+#batchInfo <- as.data.frame(batchInfo)
+
+table(batchInfo$batch_size, batchInfo$SSL_ratio_bin)
+```
+
+Stratified by SSL / cADN ratios and batches are split strictly between train and test. 
+```{r, train test split}
+# Train/Test split according to batches => trying to balance the conditions
+# trainBatches
+trainBatches <- stratified(batchInfo, 
+                           group=c("batch_size", "SSL_ratio_bin"), 
+                           size=0.55)
+testBatches <- subset(batchInfo, !(batch %in% trainBatches$batch))
+```
+
+Edit (19.09.2022)
+Remove misslabelled sample. This was a decision taken after the original train/test split, 
+thus this sample is taken out after splitting the data in train and test batches. 
+```{r, sample relabelling}
+# Remove sample with uncertain label (S5)
+meta <- meta[patient_id!="S5",]
+
+# Change lesion type for misclassified sample (S18)
+# renamed with: mv S18_cADN_pe.deduplicated.CpG_report.txt S18_SSL_pe.deduplicated.CpG_report.txt
+meta[patient_id=="S18" & condition=="cADN", ]$sample <- "S18_SSL"
+meta[patient_id=="S18" & condition=="cADN", ]$file_name <- "S18_SSL_pe.deduplicated.CpG_report.txt"
+meta[patient_id=="S18" & condition=="cADN", ]$file <- file.path(methFilePath, "S18_SSL_pe.deduplicated.CpG_report.txt")
+meta[patient_id=="S18" & condition=="cADN", ]$condition <- "SSL"
+
+write.table(meta, "./meta_data/metaDataIdReLabelled.txt",sep="\t", row.names=FALSE)
+```
+
+Get train and test samples:
+```{r}
+sum(trainBatches$SSL)/sum(trainBatches$cADN,trainBatches$SSL)
+sum(testBatches$SSL)/sum(testBatches$cADN,testBatches$SSL)
+sum(testBatches$batch_size)/sum(trainBatches$batch_size,testBatches$batch_size)
+
+trainSampleIds <- subset(patientConditions, batch %in% trainBatches$batch)$patient
+testSampleIds <- subset(patientConditions, batch %in% testBatches$batch)$patient
+trainSamples <- subset(meta, patient_id %in% trainSampleIds)
+testSamples <- subset(meta, patient_id %in% testSampleIds)
+
+trainSamples$sample <- factor(trainSamples$sample, levels=trainSamples$sample)
+trainSamples$file <- factor(trainSamples$file, levels=trainSamples$file)
+testSamples$sample <- factor(testSamples$sample, levels=testSamples$sample)
+testSamples$file <- factor(testSamples$file, levels=testSamples$file)
+```
+
+# Section 3: Create the bsseq objects
+
+```{r, create bsseq objects}
+# Read only in locations of CpGs within probes
+# train set
+bismarkBSseqTrain <- read.bismark(files = as.character(trainSamples$file),
+                                  loci= probLoci,
+                                  rmZeroCov = FALSE,
+                                  strandCollapse = TRUE,
+                                  verbose = TRUE, 
+                                  colData = DataFrame(trainSamples),
+                                  BPPARAM = MulticoreParam(1),
+                                  nThread = 1,
+                                  replace = TRUE)
+rowData(bismarkBSseqTrain) <- probeLociAnnot
+
+saveRDS(trainSamples, "./data/train_samples_ids.rds")
+saveRDS(bismarkBSseqTrain, "./data/bismarkBSseq_train_ids.rds")
+
+# test set 
+bismarkBSseqTest <- read.bismark(files = as.character(testSamples$file),
+                                 loci= probLoci,
+                                 rmZeroCov = FALSE,
+                                 strandCollapse = TRUE,
+                                 verbose = TRUE, 
+                                 colData = DataFrame(testSamples),
+                                 BPPARAM = MulticoreParam(1),
+                                 nThread = 1,
+                                 replace = TRUE)
+rowData(bismarkBSseqTest) <- probeLociAnnot
+
+saveRDS(testSamples, "./data/test_samples_ids.rds")
+saveRDS(bismarkBSseqTest, "./data/bismarkBSseq_test_ids.rds")
+```
+
+# Section 2: Get (Mean) Methylation of Probes and Annotations
+
+```{r, eval=FALSE}
+# Get counts out of the BSseq object
+covTrain <- getCoverage(bismarkBSseqTrain, type = "Cov") #total coverage
+methTrain <- getCoverage(bismarkBSseqTrain, type = "M") #methylated reads
+
+# Calculate the actual methylation levels (proportion of meth to total reads)
+methValsTrain <- methTrain / covTrain
+head(methValsTrain)
+
+# Add colnames to this new matrix
+colnames(methValsTrain) <- trainSamples$sample
+head(methValsTrain) #this head() is to check the first rows of the matrix, to see if what I'm doing is ok
+
+# Get CpG locations out of BSseq object
+gr <- rowRanges(bismarkBSseqTrain)
+gr # have a look
+
+# Overlap probe locations with CpG locations
+hits <- findOverlaps(prob, gr)
+hits
+
+# This part is a bit weird, I basically want to calculate the mean methylation
+# of all CpG sites that are within a probe, which will be in methProbe
+mcols(gr) <- methValsTrain
+gr$probe <- NA
+gr[subjectHits(hits)]$probe <- queryHits(hits)
+
+methProbeTrain <- gr %>% 
+  group_by(probe) %>% 
+  summarise_at(colnames(methValsTrain), mean, na.rm=TRUE)
+
+# check
+head(methProbeTrain)
+dim(methProbeTrain)
+
+# Read master table of original DMRs
+master <- read.csv(mastertab, header = TRUE)
+
+# transform this matrix into a GRanges object 
+mastergr <- GRanges(seqnames = gsub("chr","",master$Chromosome), 
+                    ranges = IRanges(start = master$start, end = master$end),
+                    category = master$Methylated.in.)
+head(mastergr) #have a look
+
+# Overlap the master DMRs with probes
+over <- findOverlaps(mastergr,prob)
+
+# This is also a bit weird, I add to the mastergr the numbers identifying each 
+#probe, so I know with DMR corresponds to each probe
+mastergr$probe <- NA
+mastergr$probe[queryHits(over)] <- subjectHits(over)
+
+#since a probe hits many master DMRs, I do a back-matching to choose a
+#single category of DMR
+prob$probe2 <- NA
+prob$probe2[subjectHits(over)] <- mastergr$probe[queryHits(over)]
+
+#then I add the right category
+idx <- match(prob$probe2, mastergr$probe) 
+prob$category <- mastergr$category[idx]
+
+#then I add that to the meth_probe table to plot
+idx <- match(methProbeTrain$probe, prob$probe) 
+methProbeTrain$category <- prob$category[idx]
+head(methProbeTrain)
+
+# Save this as a .RDS file so we don't have to run all this again
+saveRDS(methProbeTrain, file = "./data/methylation_values_per_probe_cat_Train_ids.RDS")
+```
+
+# Section 3: Process Parker et al. dataset
+
+```{r, create bsseq object parker}
+metaParker <- data.table(file_paths=list.files(methFileParkerPath, full.names=TRUE),
+                         file=list.files(methFileParkerPath, full.names=FALSE))
+
+metaParker <- subset(metaParker, grepl("CpG_report", file))
+metaParker[,c("patient_id", "condition"):=tstrsplit(file, split="_", keep=c(1,2))]
+metaParker[,condition:=fifelse(condition=="Normal", "NM", condition)]
+metaParker[,condition:=fifelse(condition=="Adenoma", "cADN", condition)]
+metaParker[,sample:=paste(patient_id, condition, sep="_")]
+
+
+#seqlevelsStyle(probLoci) <- "UCSC"
+
+# Read only in locations of CpGs within probe
+bismarkBSseq <- read.bismark(files = as.character(metaParker$file_paths),
+                             loci= probLoci,
+                             rmZeroCov = FALSE,
+                             strandCollapse = TRUE,
+                             verbose = TRUE, 
+                             colData = DataFrame(metaParker),
+                             BPPARAM = MulticoreParam(1),
+                             nThread = 1,
+                             replace = TRUE)
+
+saveRDS(bismarkBSseq, "./data/bismarkBSseq_parker_ids.rds")
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```

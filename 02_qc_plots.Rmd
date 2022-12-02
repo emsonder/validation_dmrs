@@ -1,0 +1,220 @@
+---
+title: "02 qc-plots"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(viridis)
+  library(data.table)
+  library(rtracklayer)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(bsseq)
+  library(BiocParallel)
+  library(hrbrthemes)
+  library(plotly)
+  library(ggpointdensity)
+})
+
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+# Read the data
+```{r read the data}
+# get the train patients
+trainSamples <- readRDS("./data/train_samples_ids.rds")
+
+# Probe meta data
+probAnnot <- readRDS("./meta_data/probeAnnot.rds")
+
+# Read in batch information
+batchInfo <- fread("./meta_data/batchDataId.txt")
+names(batchInfo) <- c("batch", "patient") # can be removed
+batchInfo <- unique(batchInfo, by=c("batch", "patient"))
+
+# Read in CpG_report.txt files
+bismarkBSseqTrain <- readRDS("./data/bismarkBSseq_train_ids.rds")
+```
+
+# Coverage plots
+
+Plot distribution of read-coverage per CpG site across samples (histogram)
+```{r, per CpG read-coverage, out.width="100%", out.height="100%"}
+sampleNames(bismarkBSseqTrain) <- colData(bismarkBSseqTrain)$sample #TODO: Remove it and move to 01 script
+cov2 <- getCoverage(bismarkBSseqTrain, type = "Cov", withDimnames=TRUE)
+cov2 <- data.table(cov2)
+
+cov2long <- suppressWarnings(melt(cov2, value.name = "cov", variable.name = "sample"))
+
+ggplot(cov2long, aes(cov)) +
+  geom_histogram(bins = 500, color="black", fill="white") +
+  facet_wrap(~sample)+
+  scale_x_continuous(guide = guide_axis(n.dodge=3))+
+  coord_cartesian(xlim = c(0,800))+
+  theme_ipsum()
+
+ggsave("./plots/coverage_histogram.png", units=c("cm"),
+       width=30, height=30)
+```
+
+Coverage boxplot plot (at CpGs)
+```{r, boxplot coverage}
+ggplot(cov2long, aes(x= sample, y= cov)) + #fill = sample, color=sample
+  geom_boxplot(width=0.3, color="black", alpha=0.2, outlier.shape = NA)+
+  coord_cartesian(ylim = c(0,800))+
+  labs(title="Read depth",
+       subtitle="at CpGs",
+       y="coverage",
+       x="sample")+
+  theme_ipsum()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+ggsave("./plots/coverage_boxplot.png", units=c("cm"),
+       width=40, height=20)
+```
+
+Average coverage per probe
+```{r, coverage per probe}
+probeRegions <- makeGRangesFromDataFrame(as.data.frame(probAnnot), 
+                                         keep.extra.columns=TRUE)
+probeMeth <- as.data.table(getCoverage(bismarkBSseqTrain, 
+                                       regions=probeRegions, 
+                                       type="Cov", what="perRegionAverage"))
+probeMeth$probe <- probeRegions$probe
+probeMeth$probe_width <- width(probeRegions)
+probeMeth$probe_start <- start(probeRegions)
+probeMeth$probe_chr <- as.integer(as.data.table(probeRegions)$seqnames)
+
+probeMeth <- melt(probeMeth, id.vars=c("probe", "probe_width", 
+                                       "probe_start", "probe_chr"), 
+                  variable.name="sample",
+                  value.name="average_cov")
+
+# plot coverage per probe
+probeMeth$probe_chr <- factor(probeMeth$probe_chr, levels=1:22, ordered=TRUE)
+ggplot(subset(probeMeth, average_cov>0), aes(x=probe_start, y=average_cov))+
+geom_pointdensity(size=0.1)+
+facet_grid(cols=vars(probe_chr), scales="free_x")+
+scale_color_viridis(guide=guide_colourbar(title="N Neighbors (density)"))+
+scale_y_log10()+
+labs(y="Average read depth",
+     x="Probe position")+
+theme_ipsum()+
+theme(axis.text.x=element_blank(),
+      axis.ticks.x=element_blank(),
+      panel.grid.major.x=element_blank(),
+      legend.position="none")
+ggsave("./plots/coverage_probes.png", units=c("cm"),
+       width=50, height=15)
+
+ggplot(probeMeth, aes(x=probe_width,y=average_cov))+
+geom_pointdensity(size=0.1)+
+scale_color_viridis(guide=guide_colourbar(title="N Neighbors (density)"))+
+scale_y_log10()+
+labs(x="probe width",
+     y="average coverage")+
+theme_ipsum()+
+theme(panel.grid.major.x=element_blank())
+ggsave("./plots/coverage_probes_vs_probe_width.png", units=c("cm"),
+       width=15, height=15)
+```
+
+# Total read count per sample
+```{r, read counts per sample}
+tot <- colSums(cov2)
+totdf <- data.frame(sample = pData(bismarkBSseqTrain)$sample,
+                    libsize = tot)
+
+ggplot(totdf, aes(y=sample, x=libsize)) +
+  geom_bar(stat="identity") +
+  theme_ipsum()
+
+ggsave("./plots/libsize_sample.png", units=c("cm"), height=35, width=20)
+```
+
+# Plot methylation vs coverage to check bias
+
+Mean methylation across sample per probe vs mean coverage across sample per probe
+```{r, methylation vs coverage}
+methVals <- bsseq::getMeth(bismarkBSseqTrain, what=c("perBase"), type="raw")
+
+#Calculate mean meth across samples per probe
+meanMeth <- rowMeans(methVals) 
+meanCov <- rowMeans(cov2)
+
+d <- data.frame(mean_meth = meanMeth,
+                mean_cov =  meanCov)
+
+#mean meth Vs mean cov
+ggplot(d) + aes(x=mean_cov, y=mean_meth) + 
+  geom_bin2d() + 
+  scale_fill_distiller(palette='RdBu', trans='log10') + 
+  scale_x_continuous(breaks=scales::pretty_breaks()) +
+  ylab("Mean methylation")+
+  xlab("Mean coverage")+
+  theme_ipsum()
+
+ggsave("./plots/mean_meth_mean_cov_bins.png")
+
+ggplot(d) + aes(x=mean_cov, y=mean_meth) + 
+  geom_point() + 
+  #scale_fill_distiller(palette='RdBu', trans='log10') + 
+  #scale_x_continuous(breaks=scales::pretty_breaks()) +
+  ylab("Mean methylation")+
+  xlab("Mean coverage")+
+  theme_ipsum()
+
+ggsave("./plots/mean_meth_mean_cov_points.png")
+```
+
+# Batch variable
+
+```{r, batch plots}
+batchInfo <- as.data.table(batchInfo)
+
+# LibSize
+totdf <- as.data.table(totdf)
+totdf[,patient:=tstrsplit(sample, "_", keep=1)]
+libSize <- merge(totdf, batchInfo, by=c("patient"), all.x=TRUE, all.y=FALSE) 
+
+# Methylation
+methValsLong <- melt(as.data.table(methVals))
+colnames(methValsLong) <- c("sample", "meth_val")
+methValsLong[,patient:=tstrsplit(sample, "_", keep=1)]
+methValsLong <- merge(methValsLong, batchInfo, 
+                      by=c("patient"), all.x=TRUE, all.y=FALSE)
+
+# lib size 
+ggplot(libSize, aes(x=batch, y=libsize))+
+geom_boxplot(outlier.size=0.1)+
+geom_point(alpha=0.6)+
+labs(x="batch",
+     y="coverage")+
+theme_ipsum()
+ggsave("./plots/coverage_batch_boxplot.png")
+
+# Methylation rate
+ggplot(methValsLong, aes(x=batch, y=meth_val))+
+geom_boxplot(outlier.size=0.1)+
+labs(x="batch",
+     y="Methylation rate")+
+theme_ipsum()
+ggsave("./plots/meth_rate_batch_boxplot.png")
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```

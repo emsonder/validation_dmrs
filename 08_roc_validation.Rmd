@@ -1,0 +1,396 @@
+---
+title: "08 ROC validation"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    smooth_scroll: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+library(bsseq)
+library(data.table)
+library(FDb.InfiniumMethylation.hg19)
+library(rtracklayer)
+library(GEOquery)
+library(hrbrthemes)
+library(viridis)
+library(RColorBrewer)
+library(ggplot2)
+library(gridExtra)
+library(ggnewscale)
+library(ggpubr)
+
+source("utils.R")})
+
+set.seed(1896)
+knitr::opts_chunk$set(warning=FALSE, 
+                      message=FALSE,
+                      fig.width=12, fig.height=7)
+```
+
+Extended ROC plots
+
+## Load the datasets
+
+External datasets
+```{r, data import}
+gse48684 <- readRDS("./data/gse48684.rds")
+gse131013 <- readRDS("./data/gse131013.rds")
+```
+
+Annotations
+```{r, load annotations}
+probeAnnot <- readRDS("./meta_data/probeAnnot.rds")
+probeRanges <- makeGRangesFromDataFrame(as.data.frame(probeAnnot))
+topProbes <- readRDS("./meta_data/topProbes.rds")
+topProbesRanges <- makeGRangesFromDataFrame(as.data.frame(topProbes))
+seqlevelsStyle(topProbesRanges) <- "NCBI"
+```
+
+marker probes:   
+*VIM   
+*SEPT 9  
+*NDRG4 + BMP3   
+```{r, markers}
+# get the probe ranges of the commercial kits
+vimAnnot <- subset(probeAnnot, grepl("VIM", genomic_locus))
+vimAnnot$name <- "VIM"
+sept9Annot <- subset(probeAnnot, grepl("SEPT", genomic_locus))
+sept9Annot$name <- "SEPT9"
+ndrgBmpAnnot <- subset(probeAnnot, grepl("NDRG4", genomic_locus) | 
+                                   grepl("BMP3", genomic_locus))
+ndrgBmpAnnot$name <- "NDRG4/BMP3"
+
+markerTable <- rbind(vimAnnot, sept9Annot, ndrgBmpAnnot)
+setnames(markerTable, "probe", "probe_id")
+
+# this cohort ------------------------------------------------------------------
+vimRanges <- makeGRangesFromDataFrame(as.data.frame(vimAnnot))
+seqlevelsStyle(vimRanges) <- "NCBI"
+
+sept9Ranges <- makeGRangesFromDataFrame(as.data.frame(sept9Annot))
+seqlevelsStyle(sept9Ranges) <- "NCBI"
+
+ndrgBmpRanges <- makeGRangesFromDataFrame(as.data.frame(ndrgBmpAnnot))
+seqlevelsStyle(ndrgBmpRanges) <- "NCBI"
+```
+
+## Map 
+
+Overlap once all probes
+```{r, map external data to probes}
+bismarkBSseqTest <- readRDS("./data/bismarkBSseq_test_ids.rds")
+
+# Get the methylated fraction per probe
+metTest <- bsseq::getMeth(bismarkBSseqTest, regions=probeRanges, 
+                   type="raw", what="perRegion")
+rownames(metTest) <- probeAnnot$probe
+
+# reshape the data & annotate
+metTest <- as.data.table(metTest, keep.rownames="probe_id")
+colnames(metTest) <- c("probe_id", as.character(pData(bismarkBSseqTest)$sample))
+
+metTest <- melt(metTest, id.vars=c("probe_id"), 
+                         variable.name="sample",
+                         value.name="met_frac")
+
+# label the samples
+metTest[,c("patient", "type"):=tstrsplit(sample, "_")]
+metTest[,cond_bin:=fifelse(type=="NM", "NM", "T")]
+
+# Get per sample mean methylation values
+metTestSample <- metTest[,.(met_frac=mean(met_frac, na.rm=TRUE)), by=c("sample", "cond_bin")]
+metTestSample <- subset(metTestSample, !is.na(met_frac))
+
+# External datasets ------------------------------------------------------------
+probeAnnot[,seqnames:=paste0("chr", seqnames)]
+setkey(probeAnnot, seqnames, start, end)
+
+gse131013CpGs <- foverlaps(gse131013, 
+                           probeAnnot,
+                           by.x=c("seqnames", "start", "end"),
+                           by.y=c("seqnames", "start", "end"),
+                           type=c("any"),
+                           nomatch=NULL)
+gse131013CpGs[,condition:=tstrsplit(sample, "_", keep=2)]
+gse131013CpGs[,cond_bin:=fifelse(condition=="T","T", "NM")]
+gse131013Probes <- gse131013CpGs[,.(Beta=mean(Beta, na.rm=TRUE)),
+                                    by=c("sample", "probe", "cond_bin")]
+
+gse48684CpGs <- foverlaps(gse48684, 
+                          probeAnnot,
+                          by.x=c("seqnames", "start", "end"),
+                          by.y=c("seqnames", "start", "end"),
+                          type=c("any"),
+                          nomatch=NULL)
+gse48684CpGs[,cond_bin:=fifelse(grepl("normal",condition),"NM", "T")]
+gse48684Probes <- gse48684CpGs[,.(Beta=mean(Beta, na.rm=TRUE)),
+                                  by=c("sample", "probe", "cond_bin")]
+```
+
+## Get the ROCs
+
+Top probes
+```{r, ROC of top Probes}
+gse48684Top <- subset(gse48684Probes, probe %in% topProbes$probe_id)
+gse48684Top$dataset <- "GSE48684"
+gse131013Top <- subset(gse131013Probes, probe %in% topProbes$probe_id)
+gse131013Top$dataset <- "GSE131013"
+
+gse48684Top <- gse48684Top[,.(Beta=mean(Beta, na.rm=TRUE)), by=c("sample", "cond_bin", "dataset")]
+gse131013Top <- gse131013Top[,.(Beta=mean(Beta, na.rm=TRUE)), 
+                                by=c("sample", "cond_bin", "dataset")]
+
+cols <- c("sample", "Beta", "cond_bin", "dataset")
+extDataSamplesTop<- rbind(gse48684Top[,cols,with=FALSE], 
+                          gse131013Top[,cols,with=FALSE])
+
+extDataRocTop <- getRocs(extDataSamplesTop, scores="Beta", models="dataset",
+                         labels="cond_bin", posClass="T", negClass="NM", 
+                         subSample=FALSE)
+
+metTestTop <- subset(metTest, probe_id %in% topProbes$probe_id)
+metTestTop <- metTestTop[,.(met_frac=mean(met_frac, na.rm=TRUE)), 
+                         by=c("sample", "type", "cond_bin")]
+metTestTop$dataset <- "test set"
+metTestRocTop <- getRocs(metTestTop, scores="met_frac", models="dataset",
+                      labels="cond_bin", posClass="T", negClass="NM",
+                      subSample=FALSE)
+
+rocsTop <- rbindlist(list(extDataRocTop, metTestRocTop), use.names=TRUE, fill=TRUE)
+aucDatasetsTop <- rocsTop[,.(auc=unique(auc_mod)),
+                             by=c("dataset")]
+``` 
+
+Marker probes
+```{r, ROC of marker probes}
+# Annotate and get rocs of external datasets
+gse48684Marker <- subset(gse48684Probes, probe %in% markerTable$probe_id)
+gse48684Marker <- merge(gse48684Marker, 
+                        markerTable, by.x=c("probe"), by.y=c("probe_id"))
+gse48684Marker$dataset <- "GSE48684"
+gse131013Marker <- subset(gse131013Probes, probe %in% markerTable$probe_id)
+gse131013Marker <- merge(gse131013Marker, 
+                        markerTable, by.x=c("probe"), by.y=c("probe_id"))
+gse131013Marker$dataset <- "GSE131013"
+
+gse48684Marker <- gse48684Marker[,.(Beta=mean(Beta, na.rm=TRUE)), 
+                                 by=c("sample", "cond_bin", "dataset", "name")]
+gse131013Marker <- gse131013Marker[,.(Beta=mean(Beta, na.rm=TRUE)), 
+                                   by=c("sample", "cond_bin", "dataset", "name")]
+
+gse131013Marker[,model:=paste(dataset, name, sep="_")]
+gse48684Marker[,model:=paste(dataset, name, sep="_")]
+
+cols <- c("sample", "Beta", "cond_bin", "dataset", "model")
+extDataSamplesMarker<- rbind(gse48684Marker[,cols,with=FALSE], 
+                             gse131013Marker[,cols,with=FALSE])
+
+extDataRocMarker <- getRocs(extDataSamplesMarker, scores="Beta", models="model",
+                            labels="cond_bin", posClass="T", negClass="NM", 
+                            subSample=FALSE)
+
+# Annotate & get rocs of test dataset
+metTestMarker <- subset(metTest, probe_id %in% markerTable$probe_id)
+metTestMarker$probe_id <- as.integer(metTestMarker$probe_id)
+metTestMarker <- merge(metTestMarker, 
+                       markerTable, by.x=c("probe_id"), by.y=c("probe_id"))
+metTestMarker <- metTestMarker[,.(met_frac=mean(met_frac, na.rm=TRUE)), 
+                         by=c("sample", "type", "cond_bin", "name")]
+metTestMarker$dataset <- "test set"
+metTestMarker[,model:=paste(dataset, name, sep="_")]
+
+metTestRocMarker <- getRocs(metTestMarker, scores="met_frac", models="model",
+                      labels="cond_bin", posClass="T", negClass="NM",
+                      subSample=FALSE)
+
+rocsMarker <- rbindlist(list(extDataRocMarker, metTestRocMarker), use.names=TRUE, fill=TRUE)
+aucDatasetsMarker <- rocsMarker[,.(auc=unique(auc_mod)),
+                       by=c("model", "dataset")]
+```
+
+
+Random probes
+```{r, ROC random probe selection}
+# Lesions specific probes
+probeAnnotLesions <- subset(probeAnnot, methylated_in=="cADN and SSL specific markers")
+nProbes <- nrow(probeAnnotLesions)
+
+# randomly select 30 probes and calculate ROC curves
+nSims <- 100
+nProbesSet <- 30  
+rocsRandom <- list()
+aucsRandom <- list()
+for(i in 1:nSims)
+{
+  # select random probes
+  probRandomSub <- probeAnnotLesions[sample(1:nProbes, nProbesSet),]
+  
+  # Subset & calc ROCs external datasets
+  gse48684Rand <- subset(gse48684Probes, probe %in% probRandomSub$probe)
+  gse48684Rand$dataset <- "GSE48684"
+  gse48684Rand <- gse48684Rand[,.(Beta=mean(Beta, na.rm=TRUE)), 
+                                  by=c("sample", "cond_bin", "dataset")]
+  
+  gse131013Rand <- subset(gse131013Probes, probe %in% probRandomSub$probe)
+  gse131013Rand$dataset <- "GSE131013"
+  gse131013Rand <- gse131013Rand[,.(Beta=mean(Beta, na.rm=TRUE)), 
+                                  by=c("sample", "cond_bin", "dataset")]
+  
+  cols <- c("sample", "Beta", "cond_bin", "dataset")
+  extDataSamplesRand<- rbind(gse48684Rand[,cols,with=FALSE], 
+                             gse131013Rand[,cols,with=FALSE])
+
+  extDataRocRand <- getRocs(extDataSamplesRand, scores="Beta", models="dataset",
+                            labels="cond_bin", posClass="T", negClass="NM", 
+                            subSample=FALSE)
+  extDataRocRand$model <- paste("rand", i, sep="_")
+  
+  # Subset & calc ROCs external datasets
+  metTestRand <- subset(metTest, probe_id %in% probRandomSub$probe)
+  metTestRand <- metTestRand[,.(met_frac=mean(met_frac, na.rm=TRUE)), 
+                         by=c("sample", "type", "cond_bin")]
+  metTestRand$dataset <- "test set"
+
+  metTestRocRand <- getRocs(metTestRand, scores="met_frac", models="dataset",
+                      labels="cond_bin", posClass="T", negClass="NM",
+                      subSample=FALSE)
+  metTestRocRand$model <- paste("rand", i, sep="_")
+  
+  rocRandom <- rbind(extDataRocRand, metTestRocRand, fill=TRUE)
+  rocsRandom[[i]] <- rocRandom
+  aucRandom <- rocRandom[,.(auc=unique(auc_mod)),by=c("dataset")]
+  aucRandom$model <- "rand"
+  aucsRandom[[i]] <- aucRandom
+}
+
+rocsRandom <- rbindlist(rocsRandom)
+aucsRandom <- rbindlist(aucsRandom)
+aucsRandom <- aucsRandom[,.(auc=mean(auc)), by=c("dataset", "model")]
+
+aucsRandom$model <- "Random Markers"
+```
+
+ROC plot
+```{r, ROC data annotation}
+# ROCs
+rocsTop$model <- "Top 30 Markers"
+rocsMarker[,model:=tstrsplit(model, "_", keep=2)]
+rocs <- rbindlist(list(rocsTop, rocsMarker, rocsRandom), fill=TRUE)
+rocs[,n:=.N, by=c("dataset", "model")]
+rocs[,dataset:=paste(dataset, paste0("n=",unique(n))), by=c("dataset")]
+
+# AUCs 
+aucDatasetsTop$model <- "Top 30 Markers"
+aucDatasetsMarker[,model:=tstrsplit(model, "_", keep=2)]
+aucDataSets <- rbindlist(list(aucDatasetsTop, aucDatasetsMarker, aucsRandom), fill=TRUE)
+
+aucDataSets[,dataset:=fifelse(dataset=="GSE131013",  "GSE131013 n=240", dataset)]
+aucDataSets[,dataset:=fifelse(dataset=="GSE48684",  "GSE48684 n=147", dataset)]
+aucDataSets[,dataset:=fifelse(dataset=="test set",  "test set n=48", dataset)]
+```
+
+```{r, ROC plot}
+colors <- brewer.pal(4, "Dark2")
+colorMethods <-  c("Top 30 Markers" = colors[1], 
+                   "Random Markers"="grey",
+                   "SEPT9"=colors[2],
+                   "NDRG4/BMP3"=colors[3],
+                   "VIM"=colors[4])
+
+colorAUCs <- c("Top 30 Markers" = colors[1], 
+               "Random Markers"="grey",
+               "SEPT9"=colors[2],
+               "NDRG4/BMP3"=colors[3],
+               "VIM"=colors[4])
+
+colorsRandom <- rep("grey", nSims+1)
+names(colorsRandom) <- c(unique(rocsRandom$model), "rand")
+colorValues <-  c(colorMethods,
+                  colorsRandom)
+
+alphaRandom <- rep(0.8, nSims+1)
+names(colorsRandom) <- c(unique(rocsRandom$model), "rand")
+alphaValues <- c("Top 30 Markers"= 0.9, 
+                 "SEPT9"=0.9,
+                 "NDRG4/BMP3"=0.9,
+                 "VIM"=0.9,
+                 alphaRandom)
+sizeRandom <- rep(0.4, nSims+1)
+sizeValues <- c(rep(1,4),
+                sizeRandom)
+names(sizeValues) <- c("Top 30 Markers", "SEPT9", "NDRG4/BMP3", "VIM", 
+                       c(unique(rocsRandom$model), "rand"))
+
+aucDataSets$model <- factor(aucDataSets$model, 
+                            levels=c("SEPT9", "NDRG4/BMP3", "VIM", 
+                                     "Random Markers", "Top 30 Markers"), 
+                            ordered=TRUE)
+aucDataSets$dataset <- factor(aucDataSets$dataset,
+                              levels=c("test set n=48", 
+                                       "GSE131013 n=240", 
+                                       "GSE48684 n=147"),
+                              ordered=TRUE)
+setorder(aucDataSets, dataset, model)
+
+rocs$dataset <- factor(rocs$dataset, 
+                       levels=c("test set n=48", 
+                                "GSE131013 n=240", 
+                                "GSE48684 n=147"),
+                       ordered=TRUE)
+rocPlot <- ggplot(rocs, aes(fpr, tpr, colour=model, size=model))+ 
+  facet_grid(cols=vars(dataset))+
+  geom_line(aes(group=model, alpha=model))+
+  scale_color_manual(values=colorValues, breaks=names(colorValues))+
+  scale_alpha_manual(values=alphaValues)+
+  scale_size_manual(values=sizeValues)+
+  geom_text(x=rep(0.65, nrow(aucDataSets)),
+            y=rep(c(0.05,0.15,0.25, 0.35, 0.45),3), 
+            size=4,
+            data=aucDataSets, 
+            aes(colour=model, label=paste(model,"AUC:", round(auc, 3))))+
+  labs(x="False Positive Rate",
+       y="True Positive Rate")+
+  theme_ipsum(axis_title_size=12)+
+  theme(legend.position="none")
+rocPlot
+
+# add legend
+models <- names(colorMethods)
+nModels <- length(models)
+p <- ggplot(data.frame(x=rnorm(nModels*10), y=rnorm(nModels*10), method=rep(models, 10)), aes(x=x, y=y, color=method))+scale_color_manual(name="marker", values=colorMethods)+geom_line(lwd=1.8)+  theme_ipsum(caption_size=16)+
+theme(legend.position="top", 
+      legend.text=element_text(size=12),
+      legend.title=element_text(size=12))
+
+p <- as_ggplot(get_legend(p))
+#c(colorMethods, "random"="grey"))
+
+probesValPlot <- ggarrange(rocPlot, p, nrow=2, heights=c(40,5),
+                          font.label=list(size = 16))
+probesValPlot
+g <- arrangeGrob(probesValPlot)
+
+# Save plots
+ggsave(file="./plots/rocPlotVal.png", g, width=32, height=12, units=c("cm"))
+ggsave(file="./plots/rocPlotVal.svg", g, width=32, height=12, units=c("cm"))
+```
+# Optimal Cut point
+
+Optimal cut-point misclassified (Validation set): 
+```{r, optimal cut-point test}
+optCutF1_score <- readRDS("./meta_data/optimal_cut_point.rds")
+falsClass <- subset(metTestTop, (met_frac >= optCutF1_score & cond_bin=="NM") | (met_frac <= optCutF1_score & cond_bin=="T"))
+falsClass
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```
