@@ -1,0 +1,65 @@
+---
+title: "gse131013_process.Rmd"
+output: html_document
+---
+
+```{r, include=FALSE}
+library(data.table)
+library(FDb.InfiniumMethylation.hg19)
+```
+
+```{bash, download data from the literature, eval=FALSE}
+wget -O ./data/gse131013.txt.gz https://ftp.ncbi.nlm.nih.gov/geo/series/GSE131nnn/GSE131013/suppl/GSE131013%5Fnormalized%5Fmatrix%2Etxt%2Egz
+```
+
+```{bash, extract, eval=FALSE}
+gzip -d ./data/gse131013.txt.gz
+```
+
+## Process GSE131013
+```{r}
+gse131013 <- fread("./data/gse131013.txt")
+gse131013 <- melt(gse131013, id.vars=c("ID_REF"))
+
+for (i in 1:10) gc() # seems to help
+
+gse131013Pval <- subset(gse131013, grepl("Pval", variable))
+gse131013Pval[,variable:=tstrsplit(variable, split=".", fixed=TRUE, keep=1)]
+gse131013Pval <- subset(gse131013Pval, value <= 0.05)
+saveRDS(gse131013Pval, "./data/gse131013Pval.rds")
+
+for (i in 1:10) gc()
+
+gse131013Met <- subset(gse131013, !grepl("Pval", variable))
+gse131013Met[,variable:=tstrsplit(variable, split=".", fixed=TRUE, keep=1)]
+
+for (i in 1:10) gc()
+
+gse131013 <- merge(gse131013Met, 
+                   gse131013Pval, by=c("variable", "ID_REF"), all=FALSE)
+setnames(gse131013, c("variable", "value.x", "value.y"), c("sample", "Beta", "p-val"))
+rm(gse131013Pval)
+rm(gse131013Met)
+for (i in 1:10) gc()
+
+# check which assembly => should be hg19: https://clinicalepigeneticsjournal.biomedcentral.com/articles/10.1186/s13148-021-01148-9
+hm450.hg19 <- get450k(genome='hg19')
+probeIds <- names(hm450.hg19)
+hm450.hg19 <- as.data.table(hm450.hg19)
+hm450.hg19$probe_Id <- probeIds
+
+gse131013 <- merge(gse131013, 
+                   hm450.hg19[,c("seqnames", "start", "end", "probe_Id"), with=FALSE],
+                   by.x=c("ID_REF"),
+                   by.y=c("probe_Id"),
+                   all.x=TRUE, all.y=FALSE)
+saveRDS(gse131013, "./data/gse131013.rds")
+
+for (i in 1:10) gc()
+```
+
+# Session Information
+
+```{r, sessioninfo}
+sessionInfo()
+```
