@@ -49,13 +49,21 @@ meta <- rbind(metaTrain, metaTest)
 meta$condition <- factor(meta$condition, c("NM","cADN","SSL"))
 ```
 
-Combine train and test data into one matrix
-```{r, combine data}
-# Probe meta data
+Get probe coordinates & subset to probes tested
+```{r, subset}
+# Probe coordinates
 probAnnot <- readRDS("./meta_data/probeAnnot.rds")
 probeRegions <- makeGRangesFromDataFrame(as.data.frame(probAnnot), 
                                          keep.extra.columns=TRUE)
+dmTestProbes <- readRDS("./data/dmTestProbes.rds") # probes tested
 
+# subset to probes tested
+probeRegions <- probeRegions[probeRegions$probe %in% dmTestProbes$probe_id]
+probAnnot <- subset(probAnnot, probe %in% dmTestProbes$probe_id)
+```
+
+Combine train and test data into one matrix
+```{r, combine data}
 # Get per probe methylation levels
 methProbesTrain <- as.data.table(bsseq::getMeth(bismarkBSseqTrain, 
                                  regions=probeRegions, 
