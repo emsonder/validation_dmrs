@@ -104,7 +104,7 @@ drawHm <- function(obj, regions, colMeanCategory){
                 cluster_rows = FALSE,
                 show_row_dend = FALSE,
                 show_column_dend = FALSE,
-                row_title = "Regions (n = 1102)", 
+                row_title = "Regions (n = 1096)", 
                 column_title = "Samples",
                 column_title_side = "bottom",
                 column_names_gp = gpar(fontsize = 8),
